@@ -1,0 +1,182 @@
+{
+  "main": {
+    "id": "70f2fb4cd1e81d4b",
+    "type": "split",
+    "children": [
+      {
+        "id": "e0e199737b7e34af",
+        "type": "tabs",
+        "children": [
+          {
+            "id": "19f4f09c3b4658f9",
+            "type": "leaf",
+            "state": {
+              "type": "markdown",
+              "state": {
+                "file": "Jumping Robot/Notes/fcmd vcd.md",
+                "mode": "source",
+                "source": false
+              },
+              "icon": "lucide-file",
+              "title": "fcmd vcd"
+            }
+          }
+        ]
+      }
+    ],
+    "direction": "vertical"
+  },
+  "left": {
+    "id": "1772fcea34f74ecb",
+    "type": "split",
+    "children": [
+      {
+        "id": "5923f25c25f59ee3",
+        "type": "tabs",
+        "children": [
+          {
+            "id": "48cbab63704964de",
+            "type": "leaf",
+            "state": {
+              "type": "file-explorer",
+              "state": {
+                "sortOrder": "alphabetical",
+                "autoReveal": false
+              },
+              "icon": "lucide-folder-closed",
+              "title": "Files"
+            }
+          },
+          {
+            "id": "84d53957cd3354a8",
+            "type": "leaf",
+            "state": {
+              "type": "search",
+              "state": {
+                "query": "",
+                "matchingCase": false,
+                "explainSearch": false,
+                "collapseAll": false,
+                "extraContext": false,
+                "sortOrder": "alphabetical"
+              },
+              "icon": "lucide-search",
+              "title": "Search"
+            }
+          },
+          {
+            "id": "73b10184289b7e78",
+            "type": "leaf",
+            "state": {
+              "type": "bookmarks",
+              "state": {},
+              "icon": "lucide-bookmark",
+              "title": "Bookmarks"
+            }
+          }
+        ]
+      }
+    ],
+    "direction": "horizontal",
+    "width": 300
+  },
+  "right": {
+    "id": "c7bc81d26737e99c",
+    "type": "split",
+    "children": [
+      {
+        "id": "5078fc599c12bac8",
+        "type": "tabs",
+        "children": [
+          {
+            "id": "7de1bc23eba8c59c",
+            "type": "leaf",
+            "state": {
+              "type": "backlink",
+              "state": {
+                "file": "Jumping Robot/Notes/fcmd vcd.md",
+                "collapseAll": false,
+                "extraContext": false,
+                "sortOrder": "alphabetical",
+                "showSearch": false,
+                "searchQuery": "",
+                "backlinkCollapsed": false,
+                "unlinkedCollapsed": true
+              },
+              "icon": "links-coming-in",
+              "title": "Backlinks for fcmd vcd"
+            }
+          },
+          {
+            "id": "e38dba31249a9aa2",
+            "type": "leaf",
+            "state": {
+              "type": "outgoing-link",
+              "state": {
+                "file": "Jumping Robot/Notes/fcmd vcd.md",
+                "linksCollapsed": false,
+                "unlinkedCollapsed": true
+              },
+              "icon": "links-going-out",
+              "title": "Outgoing links from fcmd vcd"
+            }
+          },
+          {
+            "id": "c43e7dda973ef18b",
+            "type": "leaf",
+            "state": {
+              "type": "tag",
+              "state": {
+                "sortOrder": "frequency",
+                "useHierarchy": true,
+                "showSearch": false,
+                "searchQuery": ""
+              },
+              "icon": "lucide-tags",
+              "title": "Tags"
+            }
+          },
+          {
+            "id": "0df18471b65143be",
+            "type": "leaf",
+            "state": {
+              "type": "outline",
+              "state": {
+                "file": "Jumping Robot/Notes/fcmd vcd.md",
+                "followCursor": false,
+                "showSearch": false,
+                "searchQuery": ""
+              },
+              "icon": "lucide-list",
+              "title": "Outline of fcmd vcd"
+            }
+          }
+        ]
+      }
+    ],
+    "direction": "horizontal",
+    "width": 300,
+    "collapsed": true
+  },
+  "left-ribbon": {
+    "hiddenItems": {
+      "switcher:Open quick switcher": false,
+      "graph:Open graph view": false,
+      "canvas:Create new canvas": false,
+      "daily-notes:Open today's daily note": false,
+      "templates:Insert template": false,
+      "command-palette:Open command palette": false,
+      "bases:Create new base": false
+    }
+  },
+  "active": "19f4f09c3b4658f9",
+  "lastOpenFiles": [
+    "Jumping Robot/README.md",
+    "Jumping Robot/Notes/fcmd vcd.md",
+    "Jumping Robot/Notes/2025-08-30.md",
+    "Jumping Robot/Notes/Untitled.canvas",
+    "Jumping Robot/Notes",
+    "Jumping Robot/N.md",
+    "Jumping Robot"
+  ]
+}
