@@ -1,11 +1,11 @@
 ## Prototype v1:
 Quadcopter drone based on stm32 and a spring leg structure
 <p align="center">
-<img src="https://github.com/YUNZHUORUI/Jumping-Robot/blob/main/Jumping-Robot-Obd/Notes/jumping_robot_v1.1.png" width="730">
+<img src="https://github.com/YUNZHUORUI/Jumping-Robot/blob/main/Jumping-Robot-Obd/Notes/jumping_robot_v1.1.png" width="630">
 </p>
 
 <p align="center">
-<img src="https://raw.githubusercontent.com/YUNZHUORUI/Jumping-Robot/main/Jumping-Robot-Obd/Notes/jumping_robot_v1.png" width="730">
+<img src="https://github.com/YUNZHUORUI/Jumping-Robot/blob/main/Jumping-Robot-Obd/Notes/jumping_robot_v1.png" width="630">
 </p>
 
 However in our test we found that the brushed motor of the quadcopter drone cannot drive the main body plus spring leg structure to take off smoothly.
