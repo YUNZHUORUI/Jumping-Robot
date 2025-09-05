@@ -1,7 +1,7 @@
 ## Prototype v1:
 Quadcopter drone based on stm32 and a spring leg structure
 <p align="center">
-<img src="https://raw.githubusercontent.com/YUNZHUORUI/Jumping-Robot/main/Jumping-Robot-Obd/Notes/jumping_robot_v1.1.png" width="730">
+<img src="https://github.com/YUNZHUORUI/Jumping-Robot/blob/main/Jumping-Robot-Obd/Notes/jumping_robot_v1.1.png" width="730">
 </p>
 
 <p align="center">
