@@ -13,12 +13,12 @@
             "state": {
               "type": "markdown",
               "state": {
-                "file": "Jumping-Robot-Obd/Notes/Prototypes.md",
+                "file": "Jumping-Robot-Obd/Notes/Control ststem.md",
                 "mode": "source",
                 "source": false
               },
               "icon": "lucide-file",
-              "title": "Prototypes"
+              "title": "Control ststem"
             }
           }
         ]
@@ -44,7 +44,7 @@
                 "autoReveal": false
               },
               "icon": "lucide-folder-closed",
-              "title": "Files"
+              "title": "文件列表"
             }
           },
           {
@@ -78,7 +78,7 @@
       }
     ],
     "direction": "horizontal",
-    "width": 300
+    "width": 305.5
   },
   "right": {
     "id": "c7bc81d26737e99c",
@@ -94,7 +94,7 @@
             "state": {
               "type": "backlink",
               "state": {
-                "file": "Jumping-Robot-Obd/Notes/Prototypes.md",
+                "file": "Jumping-Robot-Obd/Notes/Control ststem.md",
                 "collapseAll": false,
                 "extraContext": false,
                 "sortOrder": "alphabetical",
@@ -104,7 +104,7 @@
                 "unlinkedCollapsed": true
               },
               "icon": "links-coming-in",
-              "title": "Backlinks for Prototypes"
+              "title": "Backlinks for Control ststem"
             }
           },
           {
@@ -142,13 +142,13 @@
             "state": {
               "type": "outline",
               "state": {
-                "file": "Jumping-Robot-Obd/Notes/Prototypes.md",
+                "file": "Jumping-Robot-Obd/Notes/Control ststem.md",
                 "followCursor": false,
                 "showSearch": false,
                 "searchQuery": ""
               },
               "icon": "lucide-list",
-              "title": "Outline of Prototypes"
+              "title": "Outline of Control ststem"
             }
           }
         ],
@@ -161,29 +161,40 @@
   },
   "left-ribbon": {
     "hiddenItems": {
-      "switcher:Open quick switcher": false,
-      "graph:Open graph view": false,
-      "canvas:Create new canvas": false,
-      "daily-notes:Open today's daily note": false,
-      "templates:Insert template": false,
-      "command-palette:Open command palette": false,
-      "bases:Create new base": false
+      "switcher:打开快速切换": false,
+      "graph:查看关系图谱": false,
+      "canvas:新建白板": false,
+      "daily-notes:打开/创建今天的日记": false,
+      "templates:插入模板": false,
+      "command-palette:打开命令面板": false,
+      "bases:创建新数据库": false
     }
   },
   "active": "7e208c0037150376",
   "lastOpenFiles": [
-    "Jumping-Robot-Obd/Notes/jumping_robot_v1.png",
-    "Jumping-Robot-Obd/Notes/jumping_robot_v1.1.png",
-    "Jumping-Robot-Obd/Notes/Prototypes.md",
-    "Jumping Robot/Notes/jumping_robot_v1.png",
-    "Jumping-Robot-Obd/Notes/Test in doors.md",
+    "未命名.md",
+    "Jumping-Robot-Obd/Notes/Control ststem.md",
+    "Jumping-Robot-Obd/Image/jumping_robot_simulation2.gif",
+    "Jumping-Robot-Obd/Image/jumping_robot_simulation.gif",
     "Jumping-Robot-Obd/README.md",
+    "Jumping-Robot-Obd/Notes/Prototypes.md",
+    "Jumping-Robot-Obd/Image/jumping_robot_v2.png",
+    "Jumping-Robot-Obd/Image/IMG_0561.png",
+    "Jumping-Robot-Obd/Image/jumping_robot_v1.1.png",
+    "Jumping-Robot-Obd/Image/jumping_robot_simulation1.gif",
+    "Jumping-Robot-Obd/Image/jumping_robot_v1.png",
+    "Jumping-Robot-Obd/Notes/Test in doors.md",
+    "Jumping-Robot-Obd/Image",
+    "Jumping-Robot-Obd/untitled folder",
+    "Jumping-Robot-Obd/Notes/jumping_robot_v1.1.png",
+    "Jumping-Robot-Obd/Notes/jumping_robot_v1.png",
+    "Jumping-Robot-Obd/Notes/jumping_robot_simulation1.gif",
+    "Untitled",
+    "Untitled.md",
     "Jumping-Robot-Obd/Notes",
     "Jumping-Robot-Obd",
-    "Jumping Robot/Notes/jumping_robot_v1.1.png",
     "Jumping Robot/Notes/Prototypes.md",
     "Jumping Robot/Notes/Test in doors.md",
-    "Jumping Robot/Notes/Screenshot 2025-09-01 at 11.43.37 AM.png",
     "aed602ba727e1caee10664d562d3609e_raw.mp4",
     "aed602ba727e1caee10664d562d3609e_raw 1.mp4",
     "aed602ba727e1caee10664d562d3609e_raw 2.mp4",
@@ -191,12 +202,10 @@
     "Jumping Robot/README.md",
     "Jumping Robot/Notes/Aug 31 2025.md",
     "Jumping Robot/Notes/1234.md",
-    "Untitled",
     "Jumping Robot/Notes/fcmd vcd.md",
     "Jumping Robot/Notes/2025-08-30.md",
     "Jumping Robot/Notes/Untitled.canvas",
     "Jumping Robot/Notes",
-    "Jumping Robot/N.md",
-    "Jumping Robot"
+    "Jumping Robot/N.md"
   ]
 }
