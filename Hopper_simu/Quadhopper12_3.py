@@ -477,6 +477,14 @@ def rollout_and_render(env, policy_net=None, device=None, max_steps=400, determi
     ax.set_ylim(0.0, 2.0)
     ax.grid(True, alpha=0.3)
 
+    # Target Box (representing the constraint r < |x0, y0| < R)
+    target_circle = plt.Circle((0, 0), np.sqrt(env.R_sq), color='red', fill=False, linestyle='--', linewidth=1,
+                               alpha=0.3, label='$R$ boundary')
+    ax.add_patch(target_circle)
+    inner_circle = plt.Circle((0, 0), np.sqrt(env.r_sq), color='red', fill=False, linestyle='--', linewidth=1,
+                              alpha=0.3, label='$r$ boundary')
+    ax.add_patch(inner_circle)
+
     beam_line, = ax.plot([], [], lw=3, label='Beam', color='black')
     leg_line, = ax.plot([], [], lw=3, label='Leg', color='black')
     com_point_m1, = ax.plot([], [], 'ko', markersize=4, label='Body COM')
@@ -566,7 +574,7 @@ if __name__ == "__main__":
         lc=0.25, l0=0.50, g=9.81, thrust=0.314,
         max_steps=400, target_x=2.0, target_theta=-np.pi/7,  # Changed target_x for variety
         # Configure the Ballistic Launch Zone
-        r_sq=0.5 ** 2, R_sq=2.0 ** 2,
+        r_sq=0.5 ** 2, R_sq=1.5 ** 2,
         theta_min_deg=30, theta_max_deg=60
     )
 

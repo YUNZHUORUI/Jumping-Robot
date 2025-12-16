@@ -537,8 +537,8 @@ def rollout_and_render(env, policy_net=None, device=None, max_steps=400, determi
 
 
 if __name__ == "__main__":
-    FORCE_TRAIN = False
-    CONTINUE_TRAIN = True
+    FORCE_TRAIN = True
+    CONTINUE_TRAIN = False
     MODEL_PATH = "ppo_jumping_robot_hybrid.pt"
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
