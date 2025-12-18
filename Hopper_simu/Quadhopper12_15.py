@@ -2,537 +2,588 @@ import math
 import numpy as np
 import matplotlib.pyplot as plt
 from matplotlib.animation import FuncAnimation, PillowWriter
+import matplotlib.patches as patches
 import torch
 import torch.nn as nn
 import torch.optim as optim
 import os
-from scipy.integrate import solve_ivp
-from scipy.optimize import minimize_scalar
 
 
-# ==========================================
-# 1. PHYSICS & PLANNING UTILITIES
-# ==========================================
+# ==============================================================================
+# 1. 多跳物理环境 (Physics Environment with Multi-hop & Ballistic Logic)
+# ==============================================================================
 
-class SLIPDynamics:
-    def __init__(self, m=1.0, k=2000.0, l0=0.5, J=0.01, g=9.81):
-        self.m = m
-        self.k = k
-        self.l0 = l0
-        self.J = J
-        self.g = g
+class QuadHopperMultiJumpEnv:
+    def __init__(self,
+                 dt=0.005,
+                 m1=0.0363, m2=0.01, Jm=0.02, lc=0.25, l0=0.50, g=9.81, thrust=0.314,
+                 max_steps_per_hop=600,
+                 targets=[2.0, 4.5, 7.0],  # 连续跳跃的目标点 x 坐标
+                 # --- 约束条件 ---
+                 r_inner=0.5, R_outer=1.50,
+                 launch_theta_min_deg=30, launch_theta_max_deg=60,
+                 landing_pitch_target_deg=-20.0):
 
-    def flight_dynamics(self, state, t, torque):
-        # state: [x, z, theta, vx, vz, omega]
-        # x, z: CM position
-        # theta: body angle
-        return [state[3], state[4], state[5], 0, -self.g, torque / self.J]
+        self.dt = float(dt)
+        self.m1, self.m2, self.Jm = float(m1), float(m2), float(Jm)
+        self.lc, self.l0 = float(lc), float(l0)
+        self.g, self.thrust = float(g), float(thrust)
+        self.max_steps = int(max_steps_per_hop)
 
-    def stance_dynamics(self, t, y):
-        # Lagrangian Dynamics for SLIP Stance
-        # y = [r, theta, r_dot, theta_dot]
-        # Contact point is fixed at origin (0,0) relative to the stance frame
-        r, th, dr, dth = y
+        # 多跳目标管理
+        self.global_targets = targets
+        self.current_target_idx = 0
+        self.landing_pitch_target = math.radians(landing_pitch_target_deg)
 
-        # Prevent division by zero or negative radii
-        r = max(r, 0.01)
+        # 区域约束 (Ballistic Sector)
+        self.r_inner = r_inner
+        self.R_outer = R_outer
+        self.r_sq = r_inner ** 2
+        self.R_sq = R_outer ** 2
+        self.launch_theta_min = math.radians(launch_theta_min_deg)
+        self.launch_theta_max = math.radians(launch_theta_max_deg)
+        self.launch_theta_min_deg = launch_theta_min_deg
+        self.launch_theta_max_deg = launch_theta_max_deg
 
-        # Equations of Motion
-        # 1. Radial: m*r_ddot - m*r*th_dot^2 + m*g*sin(th) + k(r - l0) = 0
-        # 2. Tangential: (m*r^2 + J)*th_ddot + 2*m*r*dr*dth + m*g*r*cos(th) = 0
-
-        # Radial Acceleration
-        r_ddot = r * dth ** 2 - self.g * np.sin(th) - (self.k / self.m) * (r - self.l0)
-
-        # Angular Acceleration
-        numerator = -2 * self.m * r * dr * dth - self.m * self.g * r * np.cos(th)
-        denominator = self.m * r ** 2 + self.J
-        th_ddot = numerator / denominator
-
-        return [dr, dth, r_ddot, th_ddot]
-
-    def solve_stance(self, impact_state, dt_max=0.5):
-        # impact_state: [r, theta, r_dot, theta_dot]
-        # Events: Liftoff when spring extends back to l0
-        def liftoff_event(t, y):
-            return y[0] - self.l0
-
-        liftoff_event.terminal = True
-        liftoff_event.direction = 1.0  # Crossing from negative to positive (extension)
-
-        sol = solve_ivp(
-            self.stance_dynamics,
-            [0, dt_max],
-            impact_state,
-            events=liftoff_event,
-            rtol=1e-6, atol=1e-9,
-            max_step=0.001
-        )
-        return sol
-
-
-# ==========================================
-# 2. GYM-STYLE ENVIRONMENT
-# ==========================================
-
-class SLIPHopperEnv:
-    def __init__(self):
-        # System Constants
-        self.m = 1.0
-        self.g = 9.81
-        self.l0 = 0.5
-        self.k = 2000.0
-        self.J = 0.01
-        self.dt = 0.005
-        self.max_torque = 5.0  # N-m
-        self.max_steps = 300
-
-        # Targets
-        self.target1_x = 2.0
-        self.target1_z = 0.0  # Ground
-        self.target2_x = 4.0
-        self.target2_z = 1.5
-
-        # Feasibility Zone
-        self.R_min = 0.5
-        self.R_max = 2.0
-        self.Theta_launch_min = np.radians(30)
-        self.Theta_launch_max = np.radians(60)
-
-        self.physics = SLIPDynamics(self.m, self.k, self.l0, self.J, self.g)
-
-        # State: [x, z, theta, vx, vz, omega]
-        self.state = np.zeros(6)
-        self.steps = 0
-        self.planned_attack_angle = 0.0
-        self.stance_data = None  # Storage for plotting
+        self.reset()
 
     def reset(self):
+        # 完全重置环境
+        self.current_target_idx = 0
+        self.q = np.array([0.0, 0.0, 0.0, 1.0], dtype=np.float32)  # x, y, theta, l
+        self.dq = np.array([0.0, 0.0, 0.0, 0.0], dtype=np.float32)
+
+        # 初始随机扰动
+        self.q[2] = np.random.uniform(math.radians(-5), math.radians(5))
+
         self.steps = 0
-        self.stance_data = None
+        self.flight_state = "PRE_LAUNCH"  # 状态机: PRE_LAUNCH, BALLISTIC, APEX_ADJUST, DESCENDING
+        self.current_origin_x = 0.0  # 当前跳跃的参考原点
 
-        # --- 1. Generate Valid Start State in Feasibility Zone ---
-        r = np.sqrt(np.random.uniform(self.R_min ** 2, self.R_max ** 2))
-        theta_launch = np.random.uniform(self.Theta_launch_min, self.Theta_launch_max)
+        return self._obs()
 
-        # We start to the left of Target 1
-        dx_launch = r * np.cos(theta_launch)
-        dz_launch = r * np.sin(theta_launch)
+    def _get_current_target_rel(self):
+        # 获取相对于当前起点的目标距离
+        if self.current_target_idx >= len(self.global_targets):
+            return 0.0
+        global_target_x = self.global_targets[self.current_target_idx]
+        return global_target_x - self.current_origin_x
 
-        # Start Position
-        start_x = self.target1_x - dx_launch
-        start_z = dz_launch
+    def _obs(self):
+        # 观测空间: [dx, dy, dtheta, theta, rel_dist_x, rel_dist_y]
+        # rel_dist_x 是 "当前位置" 到 "相对当前起点的目标" 的距离
+        target_rel_dist = self._get_current_target_rel()
+        current_rel_pos = self.q[0] - self.current_origin_x
 
-        # Calculate Ballistic Velocity required to hit Target 1 (2,0) from Start
-        # Standard Projectile Motion: z = z0 + tan(th)*x - g*x^2 / (2*v^2*cos^2(th))
-        # We know Start and End, need V0.
-        # However, the prompt says "Launch angle" is theta_0.
-        # Velocity v0 is determined by the "Ballistic Constraint" formula in prompt.
+        rel_x = target_rel_dist - current_rel_pos
+        rel_y = 0.0 - self.q[1]
 
-        Delta_x = self.target1_x - start_x
-        Delta_z = self.target1_z - start_z  # Target z is 0, start z is positive
+        obs = np.array([self.dq[0], self.dq[1], self.dq[2], self.q[2], rel_x, rel_y], dtype=np.float32)
+        return obs
 
-        num = self.g * Delta_x ** 2
-        den = 2 * (np.cos(theta_launch) ** 2) * (Delta_x * np.tan(theta_launch) - Delta_z)
-
-        if den <= 0: return self.reset()  # Invalid config
-
-        v0 = np.sqrt(num / den)
-        vx0 = v0 * np.cos(theta_launch)
-        vz0 = v0 * np.sin(theta_launch)  # Usually negative if we are aiming down? No, aiming up.
-
-        # Actually, if we launch at angle theta, vz is positive.
-        # But we are falling TOWARDS T1.
-        # Let's assume the "launch" was in the past and we are at (x0, z0) with velocity vector pointing at T1?
-        # The prompt implies (x0, z0) is the PEAK or start of a ballistic arc.
-        # Let's assume we simply launch FROM (x0, z0) with calculated velocity to hit T1.
-        # Since T1 is at z=0 and we are at z>0, and launch angle is 30-60 (up), it's a parabolic arc.
-
-        # Random initial body angle
-        initial_theta = np.random.uniform(-np.pi / 2, np.pi / 2)
-
-        self.state = np.array([start_x, start_z, initial_theta, vx0, vz0, 0.0])
-
-        # --- 2. THE PLANNER: Calculate Required Attack Angle at T1 ---
-        # Goal: Find phi (attack angle) such that Stance Phase throws us to Target 2
-        self.planned_attack_angle = self._plan_stance_phase()
-
-        return self._get_obs()
-
-    def _plan_stance_phase(self):
+    def _calculate_ballistic_velocity(self, x0, y0, theta0):
         """
-        Solves the Inverse Problem:
-        What angle (phi) must the leg be at Touchdown (Target 1)
-        so that the passive spring rebound sends the drone to Target 2?
+        根据公式计算命中目标所需的初速度 v0
+        v0 = sqrt( (g * Dx^2) / (2 * cos^2(theta) * (Dx * tan(theta) - Dz)) )
         """
-        # Incoming Velocity at T1 (Approximate from conservation of energy/projectile)
-        # v_impact_sq = v0^2 + 2*g*(z_start - 0)
-        v0_sq = self.state[3] ** 2 + self.state[4] ** 2
-        v_impact_mag = np.sqrt(v0_sq + 2 * self.g * (self.state[1]))
+        # 计算相对于当前跳跃起点(Origin)的 Delta_x
+        # 比如 Origin=2.0, Target=4.5, 当前 x=2.5 -> Delta_x = 4.5 - 2.5 = 2.0
+        global_target = self.global_targets[self.current_target_idx] if self.current_target_idx < len(
+            self.global_targets) else self.q[0]
+        Delta_x = global_target - x0
+        Delta_z = 0.0 - y0  # 目标高度假设为 0
 
-        # Incoming angle (purely kinematic estimate)
-        dx = self.target1_x - self.state[0]
-        t_flight = dx / self.state[3]
-        vz_impact = self.state[4] - self.g * t_flight
-        gamma_impact = np.arctan2(vz_impact, self.state[3])  # Flight path angle
+        if Delta_x <= 0.1: return -1.0  # 目标在身后或太近
 
-        # Optimization: Minimize distance to T2 based on attack angle phi
-        def objective(phi_guess):
-            # Convert Cartesian Impact to Polar Stance Coordinates
-            # Stance frame: Origin is at the foot (fixed at T1)
-            # Impact State: r=l0, theta = phi_guess
-            # Velocity must be projected.
+        cos_t = math.cos(theta0)
+        tan_t = math.tan(theta0)
 
-            # Rotation matrix from World to Polar
-            # But simpler:
-            # r_dot = vx*cos(phi) + vz*sin(phi) (Projection on leg)
-            # r*th_dot = -vx*sin(phi) + vz*cos(phi) (Projection tangent)
+        denom = 2 * (cos_t ** 2) * (Delta_x * tan_t - Delta_z)
 
-            # Using actual impact velocity vector
-            vx_imp = self.state[3]  # Approximation: horizontal v constant
-            vz_imp = vz_impact  # Calculated above
+        if denom <= 1e-6: return -1.0  # 无解
 
-            r_dot = vx_imp * np.cos(phi_guess) + vz_imp * np.sin(phi_guess)
-            th_dot = (-vx_imp * np.sin(phi_guess) + vz_imp * np.cos(phi_guess)) / self.l0
+        v0_sq = (self.g * (Delta_x ** 2)) / denom
+        if v0_sq < 0: return -1.0
 
-            # Condition: Compression required (r_dot < 0)
-            if r_dot > 0: return 100.0  # Penalty for non-compression
+        return np.sqrt(v0_sq)
 
-            # Run Stance Sim
-            sol = self.physics.solve_stance([self.l0, phi_guess, r_dot, th_dot])
+    def _compute_dynamics(self, action, torque_only=False):
+        x, y, theta, l = self.q
 
-            if not sol.success or len(sol.t) < 2: return 100.0
+        # --- Action 处理 ---
+        F1, F2 = 0.0, 0.0
 
-            # Liftoff State
-            end_y = sol.y[:, -1]
-            theta_lo = end_y[1]
-            dr_lo = end_y[2]
-            dth_lo = end_y[3]
+        if torque_only:
+            # APEX 阶段：仅输出微小差动推力产生力矩，不产生主要升力
+            torque_mag = 0.1 * self.thrust
+            # action[0]=1 -> F1增加 (逆时针力矩), action[1]=1 -> F2增加 (顺时针力矩)
+            # 简化模型：F1产生正升力+力矩，F2产生正升力-力矩。
+            # 为了纯力矩，我们假设 F1=T, F2=-T (物理上不可行因为桨不能反转)，
+            # 或者 F1=T, F2=0, 忽略微小升力。这里采用后者。
+            if action[0] > 0.5: F1 += torque_mag
+            if action[1] > 0.5: F2 += torque_mag
+        else:
+            # 正常推力模式
+            F1 = self.thrust * float(action[0])
+            F2 = self.thrust * float(action[1])
 
-            # Convert back to Cartesian for Flight 2
-            # V_lift_x = dr*cos(th) - r*dth*sin(th)
-            # V_lift_z = dr*sin(th) + r*dth*cos(th)
-            vx_lo = dr_lo * np.cos(theta_lo) - self.l0 * dth_lo * np.sin(theta_lo)
-            vz_lo = dr_lo * np.sin(theta_lo) + self.l0 * dth_lo * np.cos(theta_lo)
+        c, s = math.cos(theta), math.sin(theta)
 
-            # Ballistic check to T2 (4, 1.5)
-            # Starting at T1 (2,0)
-            dx_t2 = self.target2_x - self.target1_x
-            dz_t2 = self.target2_z - self.target1_z
+        # --- 动力学矩阵 ---
+        M = np.array([
+            [self.m1 + self.m2, 0.0, l * self.m1 * c, self.m1 * s],
+            [0.0, self.m1 + self.m2, -l * self.m1 * s, self.m1 * c],
+            [l * self.m1 * c, -l * self.m1 * s, self.Jm + (l ** 2) * self.m1, 0],
+            [self.m1 * s, self.m1 * c, 0, self.m1]
+        ], dtype=np.float64)
 
-            # Projectile error
-            # t_peak = vz_lo / g
-            # Check if we can reach x=4
-            t_reach = dx_t2 / vx_lo if vx_lo > 0.1 else 0
-            z_at_reach = 0 + vz_lo * t_reach - 0.5 * self.g * t_reach ** 2
+        B = np.array([
+            - self.m1 * (self.dq[2] ** 2) * l * s,
+            - self.m1 * (self.dq[2] ** 2) * l * c,
+            - 2.0 * self.m1 * l * self.dq[2] * (self.dq[1] * c + self.dq[0] * s),
+            (self.dq[2] ** 2) * l * self.m1 + 2 * self.dq[2] * self.dq[0] * self.m1 * c - 2 * self.dq[2] * self.dq[
+                1] * self.m1 * s
+        ], dtype=np.float64)
 
-            return abs(z_at_reach - dz_t2)
+        G = np.array([
+            0.0,
+            (self.m1 + self.m2) * self.g,
+            -self.g * l * self.m1 * s,
+            self.m1 * self.g * c
+        ], dtype=np.float64)
 
-        # Search for optimal attack angle in range [60 deg, 120 deg] (leaning back to throw forward)
-        res = minimize_scalar(objective, bounds=(np.radians(60), np.radians(130)), method='bounded')
-        return res.x
+        F_vec = np.array([
+            (F1 + F2) * s,
+            (F1 + F2) * c,
+            (F1 - F2) * self.lc,
+            0
+        ], dtype=np.float64)
+
+        # 求解加速度 ddq = M_inv * (F - B - G)
+        try:
+            ddq = np.linalg.solve(M, F_vec - B - G)
+        except np.linalg.LinAlgError:
+            ddq = np.zeros_like(self.dq)
+
+        if np.any(np.isnan(ddq)): ddq = np.zeros_like(ddq)
+        return ddq
 
     def step(self, action):
-        # Action: Torque [-1, 1] scaled
-        torque = np.clip(action[0], -1.0, 1.0) * self.max_torque
-
-        # 1. Integration (Flight Phase)
-        # Simple Euler for control loop (physics is verified robustly later)
-        x, z, th, vx, vz, omega = self.state
-
-        # Apply Gravity
-        vz -= self.g * self.dt
-        x += vx * self.dt
-        z += vz * self.dt
-
-        # Apply Torque
-        alpha = torque / self.J
-        omega += alpha * self.dt
-        th += omega * self.dt
-
-        # Normalize angle
-        th = (th + np.pi) % (2 * np.pi) - np.pi
-
-        self.state = np.array([x, z, th, vx, vz, omega])
-        self.steps += 1
-
-        # 2. Check Touchdown Condition
-        # Leg tip position
-        tip_z = z - self.l0 * np.cos(np.pi / 2 - th)  # Assuming theta 0 is horizontal right?
-        # Let's align with standard polar: theta is angle from horizontal.
-        # Leg is fixed to body?
-        # Simplification: Body angle Theta IS the leg angle in this Monopod model for the "Active" phase.
-        # The prompt says "adjust body attitude so it lands with target attack angle".
-
-        foot_z = z - self.l0 * np.sin(th)  # If theta=90 (vertical), z - l0.
-
-        reward = 0
+        reward = 0.0
         done = False
         info = {}
 
-        # Check ground impact
-        if foot_z <= 0:
+        # 计算相对于当前起点的相对位置
+        rel_x = self.q[0] - self.current_origin_x
+        rel_y = self.q[1]
+        rel_pos_sq = rel_x ** 2 + rel_y ** 2
+        current_v = np.sqrt(self.dq[0] ** 2 + self.dq[1] ** 2)
+
+        # ----------------------------------------------------------------------
+        # 状态机逻辑 (State Machine)
+        # ----------------------------------------------------------------------
+
+        # 1. PRE_LAUNCH (寻找发射窗口)
+        if self.flight_state == "PRE_LAUNCH":
+            # A. 几何约束检查
+            in_sector = (self.r_sq < rel_pos_sq < self.R_sq) and \
+                        (self.launch_theta_min < self.q[2] < self.launch_theta_max)
+
+            # B. 速度匹配检查
+            req_v = self._calculate_ballistic_velocity(self.q[0], self.q[1], self.q[2])
+            velocity_match = False
+            if req_v > 0 and abs(current_v - req_v) < 0.2:  # 允许 0.2 m/s 的误差
+                velocity_match = True
+
+            # 奖励: 引导进入 Sector 并匹配速度
+            if not in_sector:
+                reward -= 0.05  # 没进区域，轻微惩罚
+            else:
+                reward += 0.2  # 进区域奖励
+                if req_v > 0:
+                    v_err = abs(current_v - req_v)
+                    reward += 3.0 * np.exp(-5.0 * v_err)  # 速度匹配奖励
+
+            # 触发发射
+            if in_sector and velocity_match:
+                self.flight_state = "BALLISTIC"
+                reward += 20.0  # 巨大的发射奖励
+                # print(f"🚀 Launch! TargetIdx={self.current_target_idx}")
+
+        # 2. BALLISTIC (滑翔阶段 - 推力锁死)
+        if self.flight_state == "BALLISTIC":
+            action = [0, 0]  # 强制关闭推力
+            reward -= 0.01
+
+            # 检测 Apex (最高点)
+            if abs(self.dq[1]) < 0.3 and self.q[1] > 0.5:
+                self.flight_state = "APEX_ADJUST"
+
+        # 3. APEX_ADJUST (最高点姿态修正 - 仅力矩)
+        is_torque_mode = False
+        if self.flight_state == "APEX_ADJUST":
+            is_torque_mode = True
+            # 目标：调整 theta 指向 landing_pitch_target (-20 deg)
+            ang_err = abs(self.q[2] - self.landing_pitch_target)
+            reward += 1.0 * np.exp(-10.0 * ang_err)
+
+            # 如果开始显著下落，转入 Descending
+            if self.dq[1] < -0.5:
+                self.flight_state = "DESCENDING"
+
+        # 4. DESCENDING (下落 - 推力锁死)
+        if self.flight_state == "DESCENDING":
+            action = [0, 0]
+            is_torque_mode = False
+
+        # ----------------------------------------------------------------------
+        # 物理积分
+        # ----------------------------------------------------------------------
+        ddq = self._compute_dynamics(action, torque_only=is_torque_mode)
+        self.dq += ddq * self.dt
+        self.q += self.dq * self.dt
+
+        # 角度归一化 (-pi, pi)
+        self.q[2] = (self.q[2] + math.pi) % (2 * math.pi) - math.pi
+        self.steps += 1
+
+        # ----------------------------------------------------------------------
+        # 落地检测与多跳重置
+        # ----------------------------------------------------------------------
+        if self.q[1] <= 0:
+            if self.current_target_idx < len(self.global_targets):
+                target_x = self.global_targets[self.current_target_idx]
+                dist_err = abs(self.q[0] - target_x)
+                pitch_err = abs(self.q[2] - self.landing_pitch_target)
+
+                # 落地判定：位置准 & 姿态准
+                if dist_err < 0.4 and pitch_err < math.radians(20):
+                    # --- 成功落地 (Landing Success) ---
+                    reward += 50.0
+
+                    # 切换到下一个目标
+                    self.current_target_idx += 1
+
+                    if self.current_target_idx >= len(self.global_targets):
+                        # 任务全部完成
+                        done = True
+                        reward += 100.0
+                    else:
+                        # --- 模拟 Stance Phase (原地重置) ---
+                        # 将当前落点设为新的 "原点"
+                        self.current_origin_x = self.q[0]
+                        # 动能归零 (模拟触地吸能)
+                        self.dq[:] = 0.0
+                        self.q[1] = 0.0
+                        # 状态重置为寻找下一次发射
+                        self.flight_state = "PRE_LAUNCH"
+                else:
+                    # --- 失败 (Crash) ---
+                    done = True
+                    reward -= 50.0  # 坠毁惩罚
+            else:
+                done = True
+
+        # 超时
+        if self.steps >= self.max_steps:
             done = True
 
-            # --- 3. TRANSITION TO STANCE & EVALUATE ---
-            # Calculate error between current angle and planned angle
-            angle_error = abs(th - self.planned_attack_angle)
-
-            # Run the Stance Physics (High Fidelity)
-            # Transform to polar velocity
-            r_dot = vx * np.cos(th) + vz * np.sin(th)
-            th_dot = (-vx * np.sin(th) + vz * np.cos(th)) / self.l0
-
-            # Solve Stance
-            sol = self.physics.solve_stance([self.l0, th, r_dot, th_dot])
-            self.stance_data = sol
-
-            # Did we crash in stance? (r < 0.1)
-            if np.min(sol.y[0]) < 0.1:
-                reward = -50.0  # Crash
-            else:
-                # Liftoff State
-                end_y = sol.y[:, -1]
-                th_lo = end_y[1]
-                dr_lo = end_y[2]
-                dth_lo = end_y[3]
-
-                # Flight 2 Projectile
-                vx_lo = dr_lo * np.cos(th_lo) - self.l0 * dth_lo * np.sin(th_lo)
-                vz_lo = dr_lo * np.sin(th_lo) + self.l0 * dth_lo * np.cos(th_lo)
-
-                # Check closeness to T2
-                dx_t2 = self.target2_x - x  # Approximate x is T1
-                if vx_lo > 0.1:
-                    t_reach = dx_t2 / vx_lo
-                    z_reach = vz_lo * t_reach - 0.5 * self.g * t_reach ** 2
-
-                    dist_error = np.sqrt((z_reach - self.target2_z) ** 2)
-
-                    # Reward: High for matching T2, High for matching planned angle
-                    r_dist = 10.0 * np.exp(-2.0 * dist_error)
-                    r_angle = 5.0 * np.exp(-10.0 * angle_error)
-                    reward = r_dist + r_angle
-
-                    info['z_reach'] = z_reach
-                    info['dist_error'] = dist_error
-                else:
-                    reward = -10.0  # Backward or stalled
-
-            # Print analysis as requested
-            print(f"Impact: Planned Phi={np.degrees(self.planned_attack_angle):.1f}°, Actual={np.degrees(th):.1f}°")
-            print(f"Reward: {reward:.2f}")
-
-        else:
-            # Flight Phase Shaping Reward: Minimize angle error progressively
-            err = abs(th - self.planned_attack_angle)
-            reward = -0.1 * err  # Dense penalty to guide PPO
-
-        # Bounds check
-        if x > self.target1_x + 0.5 or z < -0.1 or self.steps > self.max_steps:
+        # 翻滚保护
+        if abs(self.q[2]) > math.radians(100):
             done = True
             reward -= 10.0
 
-        return self._get_obs(), reward, done, info
+        info['state_phase'] = self.flight_state
+        return self._obs(), reward, done, info
 
-    def _get_obs(self):
-        # Observation: [z, theta, vz, omega, target_theta_error]
-        err = self.state[2] - self.planned_attack_angle
-        return np.array([self.state[1], self.state[2], self.state[4], self.state[5], err], dtype=np.float32)
+    def beam_endpoints(self):
+        # 用于绘图辅助
+        cx, cy, theta = self.q[0], self.q[1], self.q[2]
+        dx = math.cos(theta) * self.lc
+        dy = math.sin(theta) * self.lc
+        left = (cx - dx + self.l0 * math.sin(theta), cy + dy + self.l0 * math.cos(theta))
+        right = (cx + dx + self.l0 * math.sin(theta), cy - dy + self.l0 * math.cos(theta))
+        tip = (cx + math.sin(theta) * self.l0, cy + math.cos(theta) * self.l0)
+        return left, right, tip
 
 
-# ==========================================
-# 3. PPO AGENT (Standard Implementation)
-# ==========================================
+# ==============================================================================
+# 2. PPO 算法 (Training & Inference)
+# ==============================================================================
 
 class ActorCritic(nn.Module):
-    def __init__(self, obs_dim, act_dim):
-        super(ActorCritic, self).__init__()
+    def __init__(self, obs_dim=6, hidden=256):  # Obs dim 增加到 6
+        super().__init__()
         self.actor = nn.Sequential(
-            nn.Linear(obs_dim, 64), nn.Tanh(),
-            nn.Linear(64, 256), nn.Tanh(),
-            nn.Linear(256, 64), nn.Tanh(),
-            nn.Linear(64, act_dim), nn.Tanh()  # Output -1 to 1
+            nn.Linear(obs_dim, hidden), nn.Tanh(),
+            nn.Linear(hidden, hidden), nn.Tanh(),
+            nn.Linear(hidden, 2)  # Output logits for Bernoulli
         )
         self.critic = nn.Sequential(
-            nn.Linear(obs_dim, 64), nn.Tanh(),
-            nn.Linear(64, 64), nn.Tanh(),
-            nn.Linear(64, 1)
+            nn.Linear(obs_dim, hidden), nn.Tanh(),
+            nn.Linear(hidden, hidden), nn.Tanh(),
+            nn.Linear(hidden, 1)
         )
+        self._init_weights()
+
+    def _init_weights(self):
+        for m in self.modules():
+            if isinstance(m, nn.Linear):
+                nn.init.xavier_uniform_(m.weight)
+                nn.init.constant_(m.bias, 0.0)
 
     def forward(self, x):
-        return self.actor(x), self.critic(x)
-
-    def get_action(self, x, action=None):
-        mu, v = self.forward(x)
-        log_std = -0.5 * torch.ones_like(mu)  # Fixed std dev for exploration
-        std = torch.exp(log_std)
-        dist = torch.distributions.Normal(mu, std)
-
-        if action is None:
-            action = dist.sample()
-
-        log_prob = dist.log_prob(action).sum(axis=-1)
-        return action, log_prob, v
+        logits = self.actor(x)
+        value = self.critic(x).squeeze(-1)
+        return logits, value
 
 
-def train_ppo(env, num_episodes=500):
-    device = torch.device("cpu")
-    model = ActorCritic(obs_dim=5, act_dim=1).to(device)
-    optimizer = optim.Adam(model.parameters(), lr=1e-3)
+def compute_gae(rewards, values, dones, gamma=0.99, lam=0.95):
+    T = len(rewards)
+    advs = np.zeros(T, dtype=np.float32)
+    lastgaelam = 0.0
+    for t in reversed(range(T)):
+        next_val = 0.0 if t == T - 1 else values[t + 1]
+        next_non_terminal = 0.0 if dones[t] else 1.0
 
-    gamma = 0.99
-    clip_ratio = 0.2
-
-    rewards_history = []
-
-    for ep in range(num_episodes):
-        obs = env.reset()
-        done = False
-
-        states, actions, rewards, log_probs, values = [], [], [], [], []
-
-        while not done:
-            obs_t = torch.tensor(obs, dtype=torch.float32).unsqueeze(0).to(device)
-            with torch.no_grad():
-                action, log_prob, val = model.get_action(obs_t)
-
-            act_np = action.cpu().numpy()[0]
-            next_obs, r, done, info = env.step(act_np)
-
-            states.append(obs_t)
-            actions.append(action)
-            rewards.append(r)
-            log_probs.append(log_prob)
-            values.append(val)
-
-            obs = next_obs
-
-        # PPO Update (Simplified one-step batch per episode for brevity)
-        rewards_history.append(sum(rewards))
-
-        returns = []
-        g = 0
-        for r in reversed(rewards):
-            g = r + gamma * g
-            returns.insert(0, g)
-        returns = torch.tensor(returns, dtype=torch.float32).to(device)
-
-        # Optimize
-        states = torch.cat(states)
-        actions = torch.cat(actions)
-        log_probs = torch.stack(log_probs).squeeze()
-        values = torch.cat(values).squeeze()
-
-        adv = returns - values.detach()
-
-        # Re-evaluate
-        _, new_log_probs, _ = model.get_action(states, actions)
-        ratio = torch.exp(new_log_probs - log_probs)
-
-        surr1 = ratio * adv
-        surr2 = torch.clamp(ratio, 1 - clip_ratio, 1 + clip_ratio) * adv
-        loss = -torch.min(surr1, surr2).mean() + 0.5 * ((returns - values) ** 2).mean()
-
-        optimizer.zero_grad()
-        loss.backward()
-        optimizer.step()
-
-        if ep % 50 == 0:
-            print(f"Episode {ep}, Reward: {sum(rewards):.2f}")
-
-    return model, rewards_history
+        delta = rewards[t] + gamma * next_val * next_non_terminal - values[t]
+        lastgaelam = delta + gamma * lam * next_non_terminal * lastgaelam
+        advs[t] = lastgaelam
+    returns = advs + values
+    return returns, (advs - advs.mean()) / (advs.std() + 1e-8)
 
 
-# ==========================================
-# 4. VISUALIZATION
-# ==========================================
+def train_ppo(env, device, model_path="ppo_multihop.pt", num_updates=2000):
+    net = ActorCritic(obs_dim=6).to(device)
+    opt = optim.Adam(net.parameters(), lr=3e-4)
 
-def visualize(env, model):
+    print(f"Starting PPO Training on {device}...")
+    batch_size = 2048
+
+    for update in range(num_updates):
+        obs_buf, act_buf, logp_buf, rew_buf, val_buf, done_buf = [], [], [], [], [], []
+
+        # --- Collection Phase ---
+        steps = 0
+        while steps < batch_size:
+            obs = env.reset()
+            done = False
+            while not done:
+                o_tensor = torch.tensor(obs, dtype=torch.float32, device=device).unsqueeze(0)
+                with torch.no_grad():
+                    logits, val = net(o_tensor)
+
+                dist = torch.distributions.Bernoulli(logits=logits)
+                action = dist.sample()
+                logp = dist.log_prob(action).sum().item()
+                action_np = action.cpu().numpy()[0]
+
+                next_obs, r, done, _ = env.step(action_np)
+
+                obs_buf.append(obs)
+                act_buf.append(action_np)
+                logp_buf.append(logp)
+                rew_buf.append(r)
+                val_buf.append(val.item())
+                done_buf.append(done)
+
+                obs = next_obs
+                steps += 1
+                if done or steps >= batch_size:
+                    break
+
+        # --- Update Phase ---
+        obs_t = torch.tensor(np.array(obs_buf), dtype=torch.float32, device=device)
+        act_t = torch.tensor(np.array(act_buf), dtype=torch.float32, device=device)
+        logp_t = torch.tensor(np.array(logp_buf), dtype=torch.float32, device=device)
+
+        returns, advs = compute_gae(rew_buf, val_buf, done_buf)
+        ret_t = torch.tensor(returns, dtype=torch.float32, device=device)
+        adv_t = torch.tensor(advs, dtype=torch.float32, device=device)
+
+        # Mini-batch update
+        idxs = np.arange(len(obs_buf))
+        for _ in range(4):  # epochs
+            np.random.shuffle(idxs)
+            for start in range(0, len(idxs), 512):
+                mb = idxs[start:start + 512]
+
+                logits, val = net(obs_t[mb])
+                dist = torch.distributions.Bernoulli(logits=logits)
+                new_logp = dist.log_prob(act_t[mb]).sum(dim=-1)
+
+                ratio = torch.exp(new_logp - logp_t[mb])
+                surr1 = ratio * adv_t[mb]
+                surr2 = torch.clamp(ratio, 0.8, 1.2) * adv_t[mb]
+
+                policy_loss = -torch.min(surr1, surr2).mean()
+                value_loss = ((ret_t[mb] - val.squeeze(-1)) ** 2).mean()
+                entropy = dist.entropy().mean()
+
+                loss = policy_loss + 0.5 * value_loss - 0.01 * entropy
+
+                opt.zero_grad()
+                loss.backward()
+                opt.step()
+
+        avg_rew = np.sum(rew_buf) / (np.sum(done_buf) + 1e-8)
+        if update % 10 == 0:
+            print(f"Update {update}: Avg Reward per Ep = {avg_rew:.2f}")
+            torch.save(net.state_dict(), model_path)
+
+    return net
+
+
+# ==============================================================================
+# 3. 可视化 (Visualization with Dynamic Wedge)
+# ==============================================================================
+
+def rollout_and_render_multihop(env, policy_net, device, max_steps=800, save_gif=True, filename='multihop_mission.gif'):
+    frames = []
     obs = env.reset()
     done = False
+    steps = 0
 
-    # Storage for Flight 1
-    x_traj, z_traj = [], []
+    print("Simulating rollout for visualization...")
 
-    print("\nSimulating Final Trajectory...")
-    while not done:
-        x_traj.append(env.state[0])
-        z_traj.append(env.state[1])
-
-        obs_t = torch.tensor(obs, dtype=torch.float32).unsqueeze(0)
+    while not done and steps < max_steps:
+        # PPO Action
+        o_tensor = torch.tensor(obs, dtype=torch.float32, device=device).unsqueeze(0)
         with torch.no_grad():
-            action, _, _ = model.get_action(obs_t)
+            logits, _ = policy_net(o_tensor)
+        # 确定性选择 (Deterministic for vis)
+        action = (torch.sigmoid(logits) > 0.5).cpu().numpy()[0].astype(int)
 
-        obs, r, done, info = env.step(action.numpy()[0])
+        next_obs, _, done, info = env.step(action)
 
-    # Prepare Plot
-    fig, ax = plt.subplots(figsize=(10, 6))
+        # 记录数据
+        left, right, tip = env.beam_endpoints()
+        frames.append({
+            'q': env.q.copy(),
+            'left': left, 'right': right, 'tip': tip,
+            'origin_x': env.current_origin_x,
+            'flight_state': env.flight_state,
+            'target_idx': env.current_target_idx,
+            'step': steps
+        })
+
+        obs = next_obs
+        steps += 1
+
+    # --- Matplotlib Animation ---
+    print(f"Generating animation ({len(frames)} frames)...")
+    fig, ax = plt.subplots(figsize=(12, 6))
     ax.set_aspect('equal')
-    ax.grid(True)
-    ax.set_title("Monopod Hopping Drone: Flight 1 -> SLIP Stance -> Flight 2")
+    ax.grid(True, alpha=0.3)
 
-    # 1. Plot Flight 1
-    ax.plot(x_traj, z_traj, 'b--', label='Flight 1 (Active Control)')
+    max_x = env.global_targets[-1] + 2.0
+    ax.set_xlim(-1.0, max_x)
+    ax.set_ylim(-1.0, 3.5)
 
-    # 2. Plot Stance (if available)
-    if env.stance_data:
-        sol = env.stance_data
-        # Convert polar back to cartesian relative to T1
-        r = sol.y[0]
-        th = sol.y[1]
-        stance_x = env.target1_x + r * np.cos(th) * -1  # Foot is at T1, body is r away
-        # Correction: In polar, r is dist from origin. If origin is foot (T1):
-        # x_body = x_foot + r cos(theta)
-        # z_body = z_foot + r sin(theta)
-        sx = env.target1_x + r * np.cos(th)
-        sz = env.target1_z + r * np.sin(th)
-        ax.plot(sx, sz, 'r-', linewidth=2, label='Stance (Passive SLIP)')
+    # Ground & Targets
+    ax.plot([-2, max_x + 2], [0, 0], 'k-', lw=2)
+    for i, tx in enumerate(env.global_targets):
+        ax.plot(tx, 0, 'rx', ms=10, markeredgewidth=2)
+        ax.text(tx, -0.3, f"T{i + 1}", ha='center')
 
-        # 3. Plot Flight 2 (Analytic)
-        end_y = sol.y[:, -1]
-        th_lo = end_y[1]
-        dr_lo = end_y[2]
-        dth_lo = end_y[3]
-        vx_lo = dr_lo * np.cos(th_lo) - env.l0 * dth_lo * np.sin(th_lo)
-        vz_lo = dr_lo * np.sin(th_lo) + env.l0 * dth_lo * np.cos(th_lo)
+    # Actors
+    leg_line, = ax.plot([], [], 'k-', lw=2)
+    beam_line, = ax.plot([], [], 'k-', lw=2)
+    body_dot, = ax.plot([], [], 'bo', zorder=5)
+    traj_line, = ax.plot([], [], 'g--', alpha=0.5, lw=1)
 
-        t = np.linspace(0, 1.0, 50)
-        fx = sx[-1] + vx_lo * t
-        fz = sz[-1] + vz_lo * t - 0.5 * 9.81 * t ** 2
-        ax.plot(fx, fz, 'g--', label='Flight 2 (Ballistic)')
+    # --- Dynamic Wedge (Launch Sector) ---
+    # Convert physics angles (CW from Y) to Matplotlib (CCW from X)
+    vis_theta1 = 90 - env.launch_theta_max_deg
+    vis_theta2 = 90 - env.launch_theta_min_deg
 
-    # Targets
-    ax.plot(env.target1_x, env.target1_z, 'ko', markersize=10, label='Target 1 (Bounce)')
-    ax.plot(env.target2_x, env.target2_z, 'kx', markersize=10, label='Target 2 (Goal)')
-    ax.plot(x_traj[0], z_traj[0], 'mo', label='Start')
+    sector_patch = patches.Wedge(
+        (0, 0), env.R_outer, vis_theta1, vis_theta2,
+        width=env.R_outer - env.r_inner,
+        color='orange', alpha=0.2, label='Launch Zone'
+    )
+    ax.add_patch(sector_patch)
 
-    # Feasibility Zone (Approx visualization)
-    theta = np.linspace(env.Theta_launch_min, env.Theta_launch_max, 20)
-    for r in [env.R_min, env.R_max]:
-        zx = env.target1_x - r * np.cos(theta)
-        zz = r * np.sin(theta)
-        ax.plot(zx, zz, 'k:', alpha=0.3)
+    info_text = ax.text(0.02, 0.9, "", transform=ax.transAxes,
+                        bbox=dict(boxstyle="round", facecolor="white", alpha=0.9))
 
-    ax.legend()
+    def init():
+        return leg_line, beam_line, body_dot, traj_line, sector_patch, info_text
+
+    def update(i):
+        if i >= len(frames): return init()
+        f = frames[i]
+
+        # Geometry
+        bx, by = f['q'][0], f['q'][1]
+        lx, ly = f['left']
+        rx, ry = f['right']
+        tx, ty = f['tip']
+
+        leg_line.set_data([bx, tx], [by, ty])
+        beam_line.set_data([lx, rx], [ly, ry])
+        body_dot.set_data([bx], [by])
+
+        # Trajectory
+        start = max(0, i - 100)
+        xs = [fr['q'][0] for fr in frames[start:i]]
+        ys = [fr['q'][1] for fr in frames[start:i]]
+        traj_line.set_data(xs, ys)
+
+        # Wedge Update
+        sector_patch.set_center((f['origin_x'], 0))
+
+        # Color Coding
+        if f['flight_state'] == "PRE_LAUNCH":
+            sector_patch.set_facecolor('orange')
+            sector_patch.set_alpha(0.3)
+        elif f['flight_state'] == "BALLISTIC":
+            sector_patch.set_facecolor('green')
+            sector_patch.set_alpha(0.2)
+        else:
+            sector_patch.set_facecolor('gray')
+            sector_patch.set_alpha(0.05)
+
+        info_text.set_text(f"Step: {f['step']}\nState: {f['flight_state']}\nTarget: {f['target_idx']}")
+        return leg_line, beam_line, body_dot, traj_line, sector_patch, info_text
+
+    ani = FuncAnimation(fig, update, frames=len(frames), init_func=init, interval=30, blit=True)
+
+    if save_gif:
+        ani.save(filename, writer=PillowWriter(fps=30))
+        print(f"Saved {filename}")
+
     plt.show()
 
 
-# ==========================================
-# MAIN EXECUTION
-# ==========================================
+# ==============================================================================
+# 4. Main Execution
+# ==============================================================================
 
 if __name__ == "__main__":
-    env = SLIPHopperEnv()
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model_path = "ppo_multihop_v2.pt"
 
-    print("Training PPO Agent for Attitude Control...")
-    model, history = train_ppo(env, num_episodes=600)
+    # 定义环境 (2跳任务示例)
+    env = QuadHopperMultiJumpEnv(
+        targets=[2.5, 5.0],
+        r_inner=0.5, R_outer=1.8,
+        launch_theta_min_deg=30, launch_theta_max_deg=60
+    )
 
-    plt.figure()
-    plt.plot(history)
-    plt.title("Learning Curve: Attitude Control Accuracy")
-    plt.xlabel("Episode")
-    plt.ylabel("Total Reward")
-    plt.show()
+    policy_net = ActorCritic(obs_dim=6).to(device)
 
-    visualize(env, model)
+    # 模式选择
+    if os.path.exists(model_path):
+        print(f"Loading existing model: {model_path}")
+        policy_net.load_state_dict(torch.load(model_path, map_location=device))
+
+        # 可选：继续训练一小会儿
+        # train_ppo(env, device, model_path, num_updates=200)
+    else:
+        print("No model found, starting fresh training...")
+        train_ppo(env, device, model_path, num_updates=1000)
+
+    # 运行可视化
+    policy_net.eval()
+    rollout_and_render_multihop(env, policy_net, device, max_steps=600, save_gif=True)

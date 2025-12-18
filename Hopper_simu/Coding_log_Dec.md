@@ -43,3 +43,4 @@ $$v_{req\_y} = (\Delta z + 0.5 g (t^*)^2) / t^*$$
 
 ## Advise Dec 11
 1. PPO just control hopper to get the area ($r^2<pos<R^2$ and $30<angle<60$) 
+2. 

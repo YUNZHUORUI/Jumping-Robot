@@ -1,6 +1,5 @@
 import math
 import numpy as np
-from numpy import cos, sin, pi, tan
 import matplotlib.pyplot as plt
 from matplotlib.animation import FuncAnimation, PillowWriter
 import torch
@@ -10,37 +9,16 @@ import os
 import matplotlib.patches as patches
 
 
-# --- Derived Analytical Targets from PDF (Example: Part 1 & 2) ---
-# Assuming a flight from (x0, z0) = (0.0, 0.0) to (xt1, zt1) = (2.0, 0.0)
-# and an initial angle theta0 = 45 deg (pi/4 rad).
-g = 9.81
-delta_x = 2.0
-delta_z = 0.0
-theta_0 = pi / 4.0
-
-# 1. Required Initial Speed (v0) for Flight 1 (from PDF eq 37):
-# v0^2 = (g * Delta_x^2) / (2 * cos^2(theta0) * (Delta_x * tan(theta0) - Delta_z))
-V0_SQ = (g * delta_x ** 2) / (2 * (cos(theta_0) ** 2) * (delta_x * tan(theta_0) - delta_z))
-V0_MAG = np.sqrt(V0_SQ) # ~3.617 m/s
-
-# 2. Time-to-Impact (t*) for Flight 1 (from PDF eq 52):
-# t* = Delta_x / (v0 * cos(theta0))
-TARGET_TIME_TO_IMPACT = delta_x / (V0_MAG * math.cos(theta_0)) # ~0.782 seconds
-
-# 3. Required Attack Angle (phi) at Impact (from Part 2, simplified)
-# We assume the required launch angle for the next hop (xt1 -> xt2) is:
-TARGET_ATTACK_ANGLE_RAD = -math.radians(40) # Target attack angle phi = -40 degrees (arbitrary but fixed)
-# -------------------------------------------------------------------
-
-
-# Environment (Rotation Control Phase based on Part 3)
-class TJumpEnvRotationControl:
+# Environment (flight phase, l fixed)
+class TJumpEnvFlight2DOF:
     def __init__(self,
                  dt=0.005,
-                 m1=0.0363, m2=0.01, Jm=0.02, lc=0.25, l0=0.50, g = 9.81, thrust=0.314,
-                 target_time=TARGET_TIME_TO_IMPACT,
-                 target_phi=TARGET_ATTACK_ANGLE_RAD,
-                 max_steps=int(TARGET_TIME_TO_IMPACT / 0.005 * 1.5)): # Run 50% longer than target time
+                 m1=0.0363, m2=0.01, Jm=0.02, lc=0.25, l0=0.50, g=9.81, thrust=0.314,
+                 max_steps=400,
+                 target_x=2.0, target_theta=-np.pi / 7,
+                 # --- Ballistic Parameters ---
+                 r_sq=0.5 ** 2, R_sq=2.0 ** 2,
+                 theta_min_deg=30, theta_max_deg=60):
 
         self.dt = float(dt)
         self.m1 = float(m1)
@@ -51,55 +29,58 @@ class TJumpEnvRotationControl:
         self.g = float(g)
         self.thrust = float(thrust)
         self.max_steps = int(max_steps)
+        self.target_x = float(target_x)
+        self.target_theta = float(target_theta)
 
-        # Target parameters derived from analytical solution (Parts 1 & 2 of PDF)
-        self.target_time = float(target_time)
-        self.target_phi = float(target_phi)
+        # Launch Zone
+        self.r_sq = r_sq
+        self.R_sq = R_sq
+        self.angle_min_rad = math.radians(theta_min_deg)
+        self.angle_max_rad = math.radians(theta_max_deg)
 
         self.reset()
 
-    def reset(self, x=0, y=0.0, theta=None, l=0.50, dx=None, dy=None, dtheta=0, dl=0):
-        # Initial state fixed to the launch condition for the analytically solved flight
-        if theta is None: theta = float(np.random.uniform(pi / 6, pi / 3.0)) # Initial body angle phi_0
-        # Set launch velocity (v0) components from the analytical solution (Part 1)
-        dx = V0_MAG * cos(theta_0)
-        dy = V0_MAG * sin(theta_0)
+    def reset(self, x=0, y=0, theta=None, l=1.0, dx=None, dy=None, dtheta=0, dl=0):
+        # Initial State: Random small velocity to start
+        if dx is None: dx = float(np.random.uniform(0.5, 4.5))
+        if dy is None: dy = float(np.random.uniform(0.5, 4.5))
+        if theta is None: theta = float(np.random.uniform(math.pi / 7, math.pi / 3.0))  # 30-60 deg start
 
-        # Note: The code's theta (q[2]) represents the body angle (phi in PDF), not the flight angle (theta in PDF).
-        # We start at the launch position (0, 1.0) with the required launch velocity (dx, dy).
         self.q = np.array([x, y, theta, l], dtype=np.float32)
         self.dq = np.array([dx, dy, dtheta, dl], dtype=np.float32)
         self.steps = 0
-        self.prev_action = np.array([0, 0], dtype=np.int32)
-        self.current_time = 0.0 # New tracker for time
-
+        self.thrust_on = True  # PPO Control Active
+        self.target_locked = False  # Flag for visualization
         return self._obs()
 
     def _obs(self):
-        # State observation: [dx, dy, dtheta, theta] - same as original
+        # Simple Observation: Velocity and Angle
+        # (PPO must learn to infer position relative to target based on rewards, or we can add position later)
         obs = np.array([self.dq[0], self.dq[1], self.dq[2], self.q[2]], dtype=np.float32)
         return obs
 
     def beam_endpoints(self):
-        # Unchanged
         cx, cy, theta = float(self.q[0]), float(self.q[1]), float(self.q[2])
-        dx = cos(theta) * self.lc
-        dy = sin(theta) * self.lc
-        left = (cx - dx + self.l0 * sin(theta), cy + dy + self.l0 * cos(theta))
-        right = (cx + dx + self.l0 * sin(theta), cy - dy + self.l0 * cos(theta))
+        dx = math.cos(theta) * self.lc
+        dy = math.sin(theta) * self.lc
+        left = (cx - dx + self.l0 * math.sin(theta), cy + dy + self.l0 * math.cos(theta))
+        right = (cx + dx + self.l0 * math.sin(theta), cy - dy + self.l0 * math.cos(theta))
         return left, right
 
-    def _compute_M_B_G_F(self, action):
-        # Unchanged 4DOF dynamics, but collision logic is removed as we focus on the flight phase.
+    def _compute_dynamics(self, action):
         x, y, theta, l = [float(v) for v in self.q]
-        a = np.array(action, dtype=np.int32)
 
-        F1 = self.thrust * float(a[0])
-        F2 = self.thrust * float(a[1])
+        # --- Force Logic ---
+        if self.thrust_on:
+            F1 = self.thrust * float(action[0])
+            F2 = self.thrust * float(action[1])
+        else:
+            F1 = 0.0
+            F2 = 0.0
 
-        c, s = cos(theta), sin(theta)
+        c, s = math.cos(theta), math.sin(theta)
 
-        # M, B, G matrices calculation remains the same
+        # Standard Matrices (M, B, G, F)
         M = np.array([
             [self.m1 + self.m2, 0.0, l * self.m1 * c, self.m1 * s],
             [0.0, self.m1 + self.m2, -l * self.m1 * s, self.m1 * c],
@@ -116,101 +97,128 @@ class TJumpEnvRotationControl:
         ], dtype=np.float64)
 
         G = np.array([
-            0.0,
-            (self.m1 + self.m2) * self.g,
-            - self.g * l * self.m1 * s,
-            self.m1 * self.g * c
+            0.0, (self.m1 + self.m2) * self.g, - self.g * l * self.m1 * s, self.m1 * self.g * c
         ], dtype=np.float64)
 
-        F = np.array([
-            (F1 + F2) * s,
-            (F1 + F2) * c,
-            (F1 - F2) * self.lc, # Torque: tau = (F1-F2)*lc. This is the control input for rotation.
-            0
-        ], dtype=np.float64)
+        F = np.array([(F1 + F2) * s, (F1 + F2) * c, (F1 - F2) * self.lc, 0], dtype=np.float64)
 
-        # No collision logic for the flight phase
-        ddq = np.linalg.solve(M, F - B - G)
+        # Solve Dynamics
+        try:
+            ddq = np.linalg.solve(M, F - B - G)
+        except np.linalg.LinAlgError:
+            ddq = np.zeros(4)
 
-        if np.any(np.isnan(ddq)) or np.any(np.isinf(ddq)):
-            ddq = np.zeros_like(ddq)
-
-        return ddq, (M, B, G, F)
+        return ddq
 
     def step(self, action):
-        # 1. Dynamics Integration
-        ddq, dyn = self._compute_M_B_G_F(action)
+        # 1. Check Trajectory Requirements (Calculated EVERY step)
+        x0, y0, theta0 = self.q[0], self.q[1], self.q[2]
+        v0_sq_curr = self.dq[0] ** 2 + self.dq[1] ** 2
 
-        self.dq = (self.dq.astype(np.float64) + ddq * self.dt).astype(np.float64)
-        self.q = (self.q.astype(np.float64) + self.dq * self.dt).astype(np.float64)
+        # Target deltas
+        dx_target = self.target_x - x0
+        dy_target = 0.0 - y0  # Ground is at 0
 
-        # State cleaning
-        self.q = np.clip(self.q, -1e5, 1e5)
-        self.dq = np.clip(self.dq, -1e3, 1e3)
-        self.q[2] = (self.q[2] + pi) % (2 * pi) - pi # Normalize theta
+        # Calculate Required Velocity (Ballistic Formula)
+        # v0 = sqrt( g*dx^2 / (2*cos^2(theta) * (dx*tan(theta) - dy)) )
+        cos_th = math.cos(theta0)
+        tan_th = math.tan(theta0)
 
+        # Denominator check to avoid division by zero or negative sqrt
+        denom = 2 * (cos_th ** 2) * (dx_target * tan_th - dy_target)
+
+        v_req_sq = -1.0  # Default invalid
+        if denom > 1e-4 and dx_target > 0:
+            v_req_sq = (self.g * (dx_target ** 2)) / denom
+
+        # 2. Logic: Should we turn off thrust?
+        # Only check if we are currently using thrust
+        if self.thrust_on:
+            dist_sq = x0 ** 2 + y0 ** 2
+
+            # Condition A: Position inside Sector (r < pos < R)
+            cond_pos = (self.r_sq < dist_sq < self.R_sq)
+
+            # Condition B: Angle inside Sector (30 < theta < 60)
+            cond_ang = (self.angle_min_rad < theta0 < self.angle_max_rad)
+
+            # Condition C: Velocity Matching (with tolerance)
+            # We use squared velocity to avoid sqrt cost, tolerance needs adjustment
+            # Let's say tolerance is ~0.5 m/s difference, so roughly 0.25 diff in squares for low speeds
+            cond_vel = (v_req_sq > 0) and (abs(v0_sq_curr - v_req_sq) < 0.5)
+
+            if cond_pos and cond_ang and cond_vel:
+                self.thrust_on = False
+                self.target_locked = True
+                #print(f"🔒 LOCK OFF: x={x0:.2f}, v_curr={math.sqrt(v0_sq_curr):.2f}, v_req={math.sqrt(v_req_sq):.2f}")
+
+        # If thrust is OFF, override action to [0,0]
+        if not self.thrust_on:
+            action = [0, 0]
+
+        # 3. Physics Step
+        ddq = self._compute_dynamics(action)
+        self.dq += ddq * self.dt
+        self.q += self.dq * self.dt
+
+        # Normalize theta
+        self.q[2] = (self.q[2] + math.pi) % (2 * math.pi) - math.pi
         self.steps += 1
-        self.current_time += self.dt
 
-        # 2. Termination conditions: Fixed time for impact, or going too high/low/far
+        # 4. Reward Calculation
+        reward = 0.0
         done = False
         landed = False
 
-        if self.current_time >= self.target_time or self.steps >= self.max_steps:
+        if self.thrust_on:
+            # --- GUIDANCE PHASE REWARD ---
+            # 1. Survival Penalty (small)
+            reward -= 0.001
+
+            # 2. Velocity Tracking Reward (The most important part!)
+            if v_req_sq > 0:
+                v_err = abs(v0_sq_curr - v_req_sq)
+                # Incentive to minimize velocity error
+                reward += 2.0 * np.exp(-5.0 * v_err)
+            else:
+                # Penalty if target is physically unreachable (denom < 0)
+                reward -= 0.1
+
+            # 3. Angle Constraints
+            if not (self.angle_min_rad < theta0 < self.angle_max_rad):
+                reward -= 0.1
+
+        else:
+            # --- BALLISTIC PHASE REWARD ---
+            # Just wait for landing, minimal penalty
+            reward -= 0.001
+
+        # Termination: Ground Hit or Timeout or Bounds
+        if self.q[1] <= 0.0:
             done = True
-            if self.q[1] <= 0.0:
-                landed = True
-                self.q[1] = 0.0
-                # We do NOT stop movement on ground contact here, only check the state AT target time.
-                # self.dq[:] = 0.0 # Don't stop movement if only checking state AT time t*
+            landed = True
+            self.q[1] = 0.0  # Clamp to ground
+        elif self.steps >= self.max_steps:
+            done = True
+        elif abs(self.q[2]) > np.pi / 2:  # Flipped over
+            done = True
+            reward -= 10.0
 
-        # 3. Reward Calculation (Focus on Rotational Target)
-        reward = 0.0
-        angle = self.q[2]
-        angular_velocity = self.dq[2]
-        current_time_error = abs(self.current_time - self.target_time)
+        # Landing Reward
+        if landed:
+            dist_error = abs(self.q[0] - self.target_x)
+            if dist_error < 0.2:
+                reward += 20.0  # Big Bonus for hit
+            elif dist_error < 1.0:
+                reward += (1.0 - dist_error) * 5.0  # Partial credit
+            else:
+                reward -= dist_error * 2.0  # Penalty for miss
 
-        # R1: Time penalty
-        reward -= 0.01 * self.dt
+        info = {"dq": self.dq, "ddq": ddq, "thrust_on": self.thrust_on}
+        return self._obs(), float(reward), done, info
 
-        # R2: Angular Guiding/Control Efficiency
-        # Penalize excessive angular acceleration (torque)
-        angular_accel = ddq[2]
-        reward -= 0.01 * (angular_accel ** 2)
-
-        # R3: Terminal Reward (Maximize alignment at target time)
-        if done:
-            # We want the angle to be target_phi AT the target time
-            # Since the state is not exactly at target_time, we use the closest step.
-            ang_err = abs(angle - self.target_phi)
-
-            # Max reward 10.0 for perfect angle match at target time
-            reward += 10.0 * np.exp(-1.0 * ang_err)
-
-            # Check translational condition (optional, but good for stability)
-            # Penalize missing the landing position (xt1=2.0, zt1=0.0)
-            target_x_landing = delta_x
-            pos_err_x = abs(self.q[0] - target_x_landing)
-            pos_err_y = abs(self.q[1] - 0.0)
-            reward += 5.0 * np.exp(-10.0 * pos_err_x)
-            reward += 5.0 * np.exp(-10.0 * pos_err_y)
-
-            # Encouraging lower steps/better efficiency
-            reward -= self.steps * 0.01
-
-
-        obs = self._obs()
-        info = {
-            "ddq": ddq.astype(np.float32), "dq": self.dq.astype(np.float32),
-            "landed": landed, "dyn": dyn, "action": np.array(action, dtype=np.int32)
-        }
-        self.prev_action = np.array(action, dtype=np.int32)
-        return obs, float(reward), bool(done), info
-
-# The rest of the code (PPO, ActorCritic, compute_gae, train_ppo, rollout_and_render)
-# remains the same, as the PPO structure is general and the visualizer is still useful.
-# ... (omitting the PPO/render boilerplate for conciseness) ...
-
+# The rest of the code (PPO, ActorCritic, train_ppo, rollout_and_render) remains
+# largely the same, but the main execution block is simplified:
 # PPO (Bernoulli heads)
 if torch is not None:
     class ActorCritic(nn.Module):
@@ -230,6 +238,7 @@ if torch is not None:
                 nn.Tanh(),
                 nn.Linear(hidden, 1)
             )
+            # Initialize weights to prevent large initial outputs
             self._initialize_weights()
 
         def _initialize_weights(self):
@@ -274,7 +283,7 @@ def train_ppo(env,
               clip_eps=0.2,
               lr=3e-4,
               policy_net=None,
-              model_path="ppo_jumping_robot_rotation.pt"):
+              model_path="ppo_jumping_robot.pt"):
     if policy_net is None:
         net = ActorCritic(obs_dim=4).to(device)
         print("创建新的 PPO 策略网络")
@@ -373,7 +382,7 @@ def train_ppo(env,
     return net, all_rewards, best_avg
 
 
-def rollout_and_render(env, policy_net=None, device=None, max_steps=1200, deterministic=True, save_gif=True):
+def rollout_and_render(env, policy_net=None, device=None, max_steps=400, deterministic=False, save_gif=True):
     frames = []
     px, py = [], []
 
@@ -394,7 +403,7 @@ def rollout_and_render(env, policy_net=None, device=None, max_steps=1200, determ
         obs, r, done, info = env.step(action)
         x, y, th = env.q[0], env.q[1], env.q[2]
         left, right = env.beam_endpoints()
-        tip = (x + sin(th) * env.l0, y + cos(th) * env.l0)
+        tip = (x + math.sin(th) * env.l0, y + math.cos(th) * env.l0)
 
         frame_data = {
             'x': x, 'y': y, 'th': th,
@@ -411,28 +420,28 @@ def rollout_and_render(env, policy_net=None, device=None, max_steps=1200, determ
 
     fig, ax = plt.subplots(figsize=(10, 8))
     ax.set_aspect('equal')
-    ax.set_title("Jumping Robot Rotational Control Simulation")
-    ax.set_xlim(-0.5, 2.5)
-    ax.set_ylim(0.0, 1.5)
+    ax.set_title("Jumping Robot 2D Simulation")
+    ax.set_xlim(-1.0, 4)
+    ax.set_ylim(0.0, 2.0)
     ax.grid(True, alpha=0.3)
 
-    # Target: Landing point and target angle line
-    target_x = delta_x
-    target_y = 0.0
-    ax.plot([target_x], [target_y], 'gX', markersize=12, label='Target Landing (xt1, zt1)')
-    target_angle_x = target_x + 0.5 * cos(env.target_phi)
-    target_angle_y = target_y + 0.5 * sin(env.target_phi)
-    ax.plot([target_x, target_angle_x], [target_y, target_angle_y], 'r--', lw=2, alpha=0.7, label='Target Attack Angle $\\varphi$')
-
+    # Target Box (representing the constraint r < |x0, y0| < R)
+    target_circle = plt.Circle((0, 0), np.sqrt(env.R_sq), color='red', fill=False, linestyle='--', linewidth=1,
+                               alpha=0.3, label='$R$ boundary')
+    ax.add_patch(target_circle)
+    inner_circle = plt.Circle((0, 0), np.sqrt(env.r_sq), color='red', fill=False, linestyle='--', linewidth=1,
+                              alpha=0.3, label='$r$ boundary')
+    ax.add_patch(inner_circle)
 
     beam_line, = ax.plot([], [], lw=3, label='Beam', color='black')
     leg_line, = ax.plot([], [], lw=3, label='Leg', color='black')
     com_point_m1, = ax.plot([], [], 'ko', markersize=4, label='Body COM')
     com_point_m2, = ax.plot([], [], 'ko', markersize=4, label='Leg COM')
-    left_dot, = ax.plot([], [], 'o', markersize=5)
-    right_dot, = ax.plot([], [], 'o', markersize=5)
+    left_dot, = ax.plot([], [], 'o', markersize=5)   # beam 左端点
+    right_dot, = ax.plot([], [], 'o', markersize=5)  # beam 右端点
     path_line, = ax.plot([], [], 'g--', lw=1, alpha=0.7, label='Trajectory')
     ground_line, = ax.plot([-1, 4], [0, 0], 'k-', lw=2, label='Ground')
+    target_point, = ax.plot([env.target_x], [0], 'gX', markersize=12, label='Target')
     info_text = ax.text(0.02, 0.95, "", transform=ax.transAxes, fontsize=10,
                         bbox=dict(boxstyle="round,pad=0.3", facecolor="white", alpha=0.8))
     ax.legend(loc='upper right')
@@ -463,22 +472,21 @@ def rollout_and_render(env, policy_net=None, device=None, max_steps=1200, determ
         com_point_m1.set_data([tip[0]], [tip[1]])
         path_line.set_data(px[:i + 1], py[:i + 1])
 
-        # Left Thruster: action[0]
+        # 左端点：action[0]
         left_dot.set_data([left[0]], [left[1]])
         left_dot.set_color('blue' if action[0] == 0 else 'red')
 
-        # Right Thruster: action[1]
+        # 右端点：action[1]
         right_dot.set_data([right[0]], [right[1]])
         right_dot.set_color('blue' if action[1] == 0 else 'red')
 
         # info text
         info_text.set_text(
-            f"Step: {frame['step']} (Time: {frame['step']*env.dt:.3f} s)\n"
-            f"Target Time: {env.target_time:.3f} s\n"
-            f"Target Angle $\\varphi$: {math.degrees(env.target_phi):.1f}°\n"
-            f"Current Angle $\\theta$: {math.degrees(th):.1f}°\n"
-            f"Action (Torque): {frame['action']}\n"
-            f"Position: ({x:.2f}, {y:.2f})"
+            f"Step: {frame['step']}\n"
+            f"Action: {frame['action']}\n"
+            f"Position: ({x:.2f}, {y:.2f})\n"
+            f"Theta: {math.degrees(th):.1f}°\n"
+            f"Velocity: ({frame['dq'][0]:.2f}, {frame['dq'][1]:.2f})"
         )
         return beam_line, leg_line, com_point_m2, com_point_m1, left_dot, right_dot, path_line, info_text
 
@@ -487,13 +495,16 @@ def rollout_and_render(env, policy_net=None, device=None, max_steps=1200, determ
 
     if save_gif:
         print("Saving animation as GIF...")
-        ani.save('jumping_robot_rotation_control.gif', writer=PillowWriter(fps=20))
-        print("GIF saved as 'jumping_robot_rotation_control.gif'")
+        ani.save('jumping_robot_simulation_ground.gif', writer=PillowWriter(fps=20))
+        print("GIF saved as 'jumping_robot_simulation_ground.gif'")
 
     plt.tight_layout()
     plt.show()
     return ani
 
+
+# PPO (Bernoulli heads) and helper functions (ActorCritic, compute_gae, train_ppo)
+# ... (These sections remain the same as in your original code) ...
 
 # ----------------------------------------------------------------------
 # Main Execution Block
@@ -501,18 +512,19 @@ def rollout_and_render(env, policy_net=None, device=None, max_steps=1200, determ
 if __name__ == "__main__":
     FORCE_TRAIN = True
     CONTINUE_TRAIN = False
-    MODEL_PATH = "ppo_jumping_robot_rotation.pt" # New model path for rotation task
+    MODEL_PATH = "ppo_jumping_robot.pt"
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    # Configure the Environment
-    env = TJumpEnvRotationControl(
+    # Configure the Environment with new parameters
+    env = TJumpEnvFlight2DOF(
         dt=0.005, m1=0.0363, m2=0.01, Jm=0.02,
-        lc=0.25, l0=0.50, thrust=0.314,
-        target_time=TARGET_TIME_TO_IMPACT,
-        target_phi=TARGET_ATTACK_ANGLE_RAD
+        lc=0.25, l0=0.50, g=9.81, thrust=0.314,
+        max_steps=400, target_x=2.0, target_theta=-np.pi/7,  # Changed target_x for variety
+        # Configure the Ballistic Launch Zone
+        r_sq=0.5 ** 2, R_sq=1.5 ** 2,
+        theta_min_deg=30, theta_max_deg=60
     )
-    print(f"Environment configured with T*={env.target_time:.3f}s and Phi={math.degrees(env.target_phi):.1f}°")
 
     policy_net = None
 

@@ -8,15 +8,17 @@ import torch.optim as optim
 import os
 import matplotlib.patches as patches
 
-
-# Environment (flight phase, l fixed)
 class TJumpEnvFlight2DOF:
     def __init__(self,
                  dt=0.005,
                  m1=0.0363, m2=0.01, Jm=0.02, lc=0.25, l0=0.50, g=9.81, thrust=0.314,
-                 max_steps=350,
-                 target_x=2.0, target_theta=-np.pi / 7,
-                 # --- New Ballistic Parameters ---
+                 max_steps=400,
+                 target_x=2.0,
+                 # --- Raibert Parameters ---
+                 stance_duration=0.2,  # 预估触地时间 (s)
+                 desired_vx=1.0,  # 下一跳的期望速度 (m/s)
+                 k_raibert=0.1,  # 速度修正增益
+                 # --- Ballistic Parameters ---
                  r_sq=0.5 ** 2, R_sq=2.0 ** 2,
                  theta_min_deg=30, theta_max_deg=60):
 
@@ -30,9 +32,13 @@ class TJumpEnvFlight2DOF:
         self.thrust = float(thrust)
         self.max_steps = int(max_steps)
         self.target_x = float(target_x)
-        self.target_theta = float(target_theta)
 
-        # Ballistic Launch Zone Parameters
+        # Raibert Params
+        self.Ts = stance_duration
+        self.v_des = desired_vx
+        self.k_r = k_raibert
+
+        # Launch Zone
         self.r_sq = r_sq
         self.R_sq = R_sq
         self.angle_min_rad = math.radians(theta_min_deg)
@@ -41,26 +47,37 @@ class TJumpEnvFlight2DOF:
         self.reset()
 
     def reset(self, x=0, y=0, theta=None, l=1.0, dx=None, dy=None, dtheta=0, dl=0):
-        # Initial state randomization
-        if dx is None: dx = float(np.random.uniform(1.0, 2.0))
-        if dy is None: dy = float(np.random.uniform(1.0, 2.0))
+        # Initial State
+        if dx is None: dx = float(np.random.uniform(0.5, 1.5))
+        if dy is None: dy = float(np.random.uniform(0.5, 1.5))
         if theta is None: theta = float(np.random.uniform(math.pi / 6, math.pi / 3.0))
-        if dtheta is None: dtheta = float(np.random.uniform(-math.pi / 6, -math.pi / 3.0))
 
         self.q = np.array([x, y, theta, l], dtype=np.float32)
         self.dq = np.array([dx, dy, dtheta, dl], dtype=np.float32)
         self.steps = 0
-        self.prev_action = np.array([0, 0], dtype=np.int32)
-        self.thrust_on = True  # New state: True if PPO controls thrust, False if ballistic
-        self.target_reached_state = None  # Store state when lock is triggered
-
-        # Check for invalid values...
+        self.thrust_on = True
         return self._obs()
 
     def _obs(self):
-        # State observation: [dx, dy, dtheta, theta]
+        # 观察中加入目标落地角度可能是个好主意，但为了简单，我们先保持原样，让PPO通过Reward去学
         obs = np.array([self.dq[0], self.dq[1], self.dq[2], self.q[2]], dtype=np.float32)
         return obs
+
+    # --- 新增: Raibert 启发式计算 ---
+    def _get_raibert_theta_target(self, current_vx):
+        # Raibert 足端落点公式: x_f = (vx * Ts)/2 + k*(vx - v_des)
+        # 我们希望 vx 保持在 v_des 附近
+        xf = (current_vx * self.Ts) / 2.0 + self.k_r * (current_vx - self.v_des)
+
+        # 几何关系: sin(theta) = xf / l0
+        # 限制 xf 不超过腿长
+        ratio = np.clip(xf / self.l0, -0.9, 0.9)
+
+        # 关键: 我们需要“后仰”(Leaning Back)，意味着脚要在重心前面 (x_foot > x_com)
+        # 在这里的坐标系中，如果 theta < 0，腿向右下偏，脚在右边（前面）。
+        # 所以 theta 应该是负的 arcsin
+        theta_target = -math.asin(ratio)
+        return theta_target
 
     def beam_endpoints(self):
         cx, cy, theta = float(self.q[0]), float(self.q[1]), float(self.q[2])
@@ -70,25 +87,15 @@ class TJumpEnvFlight2DOF:
         right = (cx + dx + self.l0 * math.sin(theta), cy - dy + self.l0 * math.cos(theta))
         return left, right
 
-    def _compute_M_B_G_F(self, action):
+    def _compute_dynamics(self, action):
         x, y, theta, l = [float(v) for v in self.q]
-        # dx, dy, dtheta, dl = [float(v) for v in self.dq] # Not used for F, B, G, only M
-
-        a = np.array(action, dtype=np.int32)
-
-        # --- Critical Change: Enforce Thrust Lock ---
         if self.thrust_on:
-            F1 = self.thrust * float(a[0])
-            F2 = self.thrust * float(a[1])
+            F1 = self.thrust * float(action[0])
+            F2 = self.thrust * float(action[1])
         else:
-            F1 = 0.0
-            F2 = 0.0
-
-        # --------------------------------------------
+            F1, F2 = 0.0, 0.0
 
         c, s = math.cos(theta), math.sin(theta)
-
-        # M, B, G matrices calculation remains the same...
         M = np.array([
             [self.m1 + self.m2, 0.0, l * self.m1 * c, self.m1 * s],
             [0.0, self.m1 + self.m2, -l * self.m1 * s, self.m1 * c],
@@ -104,175 +111,121 @@ class TJumpEnvFlight2DOF:
                 1] * self.m1 * s
         ], dtype=np.float64)
 
-        G = np.array([
-            0.0,
-            (self.m1 + self.m2) * self.g,
-            - self.g * l * self.m1 * s,
-            self.m1 * self.g * c
-        ], dtype=np.float64)
+        G = np.array([0.0, (self.m1 + self.m2) * self.g, - self.g * l * self.m1 * s, self.m1 * self.g * c],
+                     dtype=np.float64)
+        F = np.array([(F1 + F2) * s, (F1 + F2) * c, (F1 - F2) * self.lc, 0], dtype=np.float64)
 
-        F = np.array([
-            (F1 + F2) * s,
-            (F1 + F2) * c,
-            (F1 - F2) * self.lc,
-            0
-        ], dtype=np.float64)
-
-        # Collision logic (remains the same)
-        if y <= 0:
-            W = np.array([[0, 1, 0, 0]], dtype=np.float64)
-            W_dot = np.zeros_like(W)
-            A = W @ np.linalg.inv(M) @ W.T
-            rhs = W @ np.linalg.inv(M) @ (B + G - F) - W_dot @ self.dq
-            lam = np.linalg.solve(A, rhs)
-            ddq = np.linalg.inv(M) @ (F - B - G + W.T @ lam)
-        else:
+        try:
             ddq = np.linalg.solve(M, F - B - G)
-
-        if np.any(np.isnan(ddq)) or np.any(np.isinf(ddq)):
-            ddq = np.zeros_like(ddq)  # Fallback to zero acceleration
-
-        return ddq, (M, B, G, F)
+        except np.linalg.LinAlgError:
+            ddq = np.zeros(4)
+        return ddq
 
     def step(self, action):
+        x0, y0, theta0 = self.q[0], self.q[1], self.q[2]
+        vx, vy, dtheta = self.dq[0], self.dq[1], self.dq[2]
+        v0_sq_curr = vx ** 2 + vy ** 2
 
-        # --- 1. Check for Ballistic Launch Condition (Only if thrust is ON) ---
-        v0_sq = self.dq[0] ** 2 + self.dq[1] ** 2
-        v0 = np.sqrt(v0_sq)
+        # 1. 弹道计算 (Ballistics)
+        dx_target = self.target_x - x0
+        dy_target = 0.0 - y0
+        cos_th = math.cos(theta0)
+        tan_th = math.tan(theta0)
+        denom = 2 * (cos_th ** 2) * (dx_target * tan_th - dy_target)
 
+        v_req_sq = -1.0
+        if denom > 1e-4 and dx_target > 0:
+            v_req_sq = (self.g * (dx_target ** 2)) / denom
+
+        # 2. Raibert 姿态计算
+        # 计算理想的落地角度 (Leaning Back)
+        raibert_theta_target = self._get_raibert_theta_target(vx)
+
+        # 3. 预测落地时的实际角度
+        # 估算剩余飞行时间 t_rem (只考虑重力影响的简单抛物线)
+        # y(t) = y0 + vy*t - 0.5*g*t^2 = 0
+        delta = vy ** 2 + 2 * self.g * y0
+        t_rem = 0.0
+        if delta >= 0:
+            t_rem = (vy + math.sqrt(delta)) / self.g
+
+        # 预测落地角度 (假设角速度不变，因为关机后力矩为0)
+        pred_theta_land = theta0 + dtheta * t_rem
+
+        # 4. 锁定逻辑 (Lock Logic)
         if self.thrust_on:
-            x0, y0, theta0 = self.q[0], self.q[1], self.q[2]
-            Delta_x = self.target_x - x0
-            Delta_z = 0.0 - y0  # Target ground height is y=0
+            dist_sq = x0 ** 2 + y0 ** 2
+            cond_pos = (self.r_sq < dist_sq < self.R_sq)
+            cond_ang = (self.angle_min_rad < theta0 < self.angle_max_rad)
+            cond_vel = (v_req_sq > 0) and (abs(v0_sq_curr - v_req_sq) < 0.5)
 
-            cos_theta0 = math.cos(theta0)
-            tan_theta0 = math.tan(theta0)
+            # [新增] 姿态锁定条件: 预测的落地角度必须接近 Raibert 目标
+            # 我们稍微放宽一点容忍度，让 PPO 容易学到 (例如 +/- 15度)
+            cond_att = abs(pred_theta_land - raibert_theta_target) < math.radians(15)
 
-            # Projectile Motion Formula Denominator (from the image)
-            den = 2 * (cos_theta0 ** 2) * (Delta_x * tan_theta0 - Delta_z)
-
-            # Required speed squared (if feasible)
-            required_v0_sq = -1.0
-            if den > 1e-6 and abs(cos_theta0) > 1e-6 and Delta_x != 0.0:
-                required_v0_sq = (self.g * Delta_x ** 2) / den
-
-            # Conditions for Thrust Lock:
-
-            # C1: Positional range check
-            pos_sq = x0 ** 2 + y0 ** 2
-            C1_pos = (self.r_sq < pos_sq < self.R_sq)
-
-            # C2: Angle range check
-            C2_angle = (self.angle_min_rad < theta0 < self.angle_max_rad)
-
-            # C3: Speed match check (v_actual approx v_required)
-            V_TOL = 0.1  # Tolerance for required speed (m/s)
-            C3_speed = (required_v0_sq > 0.0) and (np.abs(v0_sq - required_v0_sq) < V_TOL)
-
-            if C1_pos and C2_angle and C3_speed:
+            if cond_pos and cond_ang and cond_vel and cond_att:
                 self.thrust_on = False
-                action = [0, 0]  # Agent action is overridden to enforce lock
-                # Store the successful launch state for potential debugging/reward adjustment
-                self.target_reached_state = self.q.copy()
                 print(
-                    f"✅ Thrust Locked OFF at step {self.steps}! V_actual={v0:.2f}, V_req={np.sqrt(required_v0_sq):.2f}")
-            else:
-                # If not locked, the action remains the agent's output
-                pass
+                    f"🔒 LOCKED! v={math.sqrt(v0_sq_curr):.2f}, θ_land_pred={math.degrees(pred_theta_land):.1f}°, Target={math.degrees(raibert_theta_target):.1f}°")
 
-        else:
-            # If thrust is already locked, action is enforced to [0, 0]
+        if not self.thrust_on:
             action = [0, 0]
 
-        # --- 2. Dynamics Integration ---
-        ddq, dyn = self._compute_M_B_G_F(action)
-
-        self.dq = (self.dq.astype(np.float64) + ddq * self.dt).astype(np.float64)
-        self.q = (self.q.astype(np.float64) + self.dq * self.dt).astype(np.float64)
-
-        # State cleaning (clamping, theta normalization)
-        self.q = np.clip(self.q, -1e5, 1e5)
-        self.dq = np.clip(self.dq, -1e3, 1e3)
+        # 5. 物理积分
+        ddq = self._compute_dynamics(action)
+        self.dq += ddq * self.dt
+        self.q += self.dq * self.dt
         self.q[2] = (self.q[2] + math.pi) % (2 * math.pi) - math.pi
-
         self.steps += 1
 
+        # 6. Reward Calculation
+        reward = 0.0
         done = False
         landed = False
-        # Termination conditions
-        if self.q[1] <= 0.0 or self.steps >= self.max_steps or abs(self.q[2]) > self.angle_max_rad:
-            done = True
-            if self.q[1] <= 0.0:
-                landed = True
-                self.q[1] = 0.0
-                self.dq[:] = 0.0  # Stop movement on ground contact
-
-        # --- 3. Reward Calculation ---
-        reward = 0.0
 
         if self.thrust_on:
-            # PPO Phase Reward: Guide agent to launch condition
-
-            # R1: Time penalty
             reward -= 0.01
+            # A. 速度引导
+            if v_req_sq > 0:
+                reward += 2.0 * np.exp(-5.0 * abs(v0_sq_curr - v_req_sq))
+            else:
+                reward -= 0.1
 
-            # R2: Velocity matching incentive (if feasible)
-            if 'required_v0_sq' in locals() and required_v0_sq > 0.0:
-                v_mismatch = np.abs(v0_sq - required_v0_sq)
-                # Max reward = 5.0 for perfect match
-                reward += 5.0 * np.exp(-100.0 * v_mismatch)
-
-                # R3: Angular guiding
-            angle_target_rad = (self.angle_min_rad + self.angle_max_rad) / 2
-            ang_err = np.abs(self.q[2] - angle_target_rad)
-            reward += 1 * np.exp(-10.0 * ang_err)
+            # B. [新增] 姿态引导 (Attitude Guidance)
+            # 鼓励现在的状态能导致正确的落地姿态
+            att_err = abs(pred_theta_land - raibert_theta_target)
+            reward += 1.5 * np.exp(-5.0 * att_err)
 
         else:
-            # Ballistic Phase Reward: Minor step penalty
-            reward -= 0.005
+            reward -= 0.001
 
-        # R4: Angle constraint penalty (applies to both phases)
-        max_angle_rad = self.angle_max_rad
-        angle = self.q[2]
-        if abs(angle) > max_angle_rad:
-            reward -=  (abs(angle) - max_angle_rad) ** 2
+        # Check Landing
+        if self.q[1] <= 0.0:
+            done = True
+            landed = True
+            self.q[1] = 0.0
+        elif self.steps >= self.max_steps or abs(self.q[2]) > np.pi / 2:
+            done = True
+            reward -= 10.0
 
-        # R5: Terminal Reward/Penalty
-        if done and landed:
-            pos_err_x = abs(self.q[0] - self.target_x)
-            ang_err = abs(self.q[2] - self.target_theta)
-
-            if pos_err_x < 0.1:
-                # Very accurate landing
-                reward += 10.0 - 5.0 * pos_err_x
+        if landed:
+            # 落地精度奖励
+            dist_error = abs(self.q[0] - self.target_x)
+            if dist_error < 0.2:
+                reward += 20.0
             else:
-                # Heavy penalty for missing target X
-                reward -= 10.0 * pos_err_x
+                reward -= dist_error * 2.0
 
-                # Target angle matching reward
-            if ang_err < math.radians(10):
-                reward += 5.0
+            # [新增] 落地姿态最终奖励
+            final_att_err = abs(self.q[2] - raibert_theta_target)
+            if final_att_err < math.radians(10):
+                reward += 10.0  # 完美姿态落地
             else:
-                reward -= 10.0 * ang_err
+                reward -= 5.0 * final_att_err
 
-            # Encourage fewer steps
-            reward -= abs(self.steps) * 0.05
+        info = {"dq": self.dq, "ddq": ddq, "thrust_on": self.thrust_on}
+        return self._obs(), float(reward), done, info
 
-        elif done and not landed:
-            # Penalty for crash (y <= 0 without landing) or timeout
-            reward = -90.0
-
-        obs = self._obs()
-        info = {
-            "ddq": ddq.astype(np.float32), "dq": self.dq.astype(np.float32),
-            "landed": landed, "dyn": dyn, "action": np.array(action, dtype=np.int32)
-        }
-        self.prev_action = np.array(action, dtype=np.int32)
-        return obs, float(reward), bool(done), info
-
-# The rest of the code (PPO, ActorCritic, train_ppo, rollout_and_render) remains
-# largely the same, but the main execution block is simplified:
-# PPO (Bernoulli heads)
 if torch is not None:
     class ActorCritic(nn.Module):
         def __init__(self, obs_dim=4, hidden=512):
@@ -571,11 +524,16 @@ if __name__ == "__main__":
 
     # Configure the Environment with new parameters
     env = TJumpEnvFlight2DOF(
-        dt=0.005, m1=0.0363, m2=0.01, Jm=0.02,
-        lc=0.25, l0=0.50, g=9.81, thrust=0.314,
-        max_steps=400, target_x=2.0, target_theta=-np.pi/7,  # Changed target_x for variety
-        # Configure the Ballistic Launch Zone
-        r_sq=0.5 ** 2, R_sq=1.5 ** 2,
+        dt=0.005,
+        m1=0.0363, m2=0.01, Jm=0.02, lc=0.25, l0=0.50, g=9.81, thrust=0.314,
+        max_steps=400,
+        target_x=2.0,
+        # --- Raibert Parameters ---
+        stance_duration=0.2,  # 预估触地时间 (s)
+        desired_vx=1.0,  # 下一跳的期望速度 (m/s)
+        k_raibert=0.1,  # 速度修正增益
+        # --- Ballistic Parameters ---
+        r_sq=0.5 ** 2, R_sq=2.0 ** 2,
         theta_min_deg=30, theta_max_deg=60
     )
 
