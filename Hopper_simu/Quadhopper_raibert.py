@@ -8,6 +8,8 @@ import torch.optim as optim
 import os
 import matplotlib.patches as patches
 
+
+# Environment (flight phase, l fixed)
 class TJumpEnvFlight2DOF:
     def __init__(self,
                  dt=0.005,
@@ -59,25 +61,14 @@ class TJumpEnvFlight2DOF:
         return self._obs()
 
     def _obs(self):
-        # 观察中加入目标落地角度可能是个好主意，但为了简单，我们先保持原样，让PPO通过Reward去学
-        obs = np.array([self.dq[0], self.dq[1], self.dq[2], self.q[2]], dtype=np.float32)
+        # --- 关键修改：加入 x, y ---
+        # 没有位置信息，Agent 无法知道自己是否在扇形区域内，学习曲线会很差。
+        obs = np.array([
+            self.q[0], self.q[1],  # x, y
+            self.dq[0], self.dq[1],  # dx, dy
+            self.dq[2], self.q[2]  # dtheta, theta
+        ], dtype=np.float32)
         return obs
-
-    # --- 新增: Raibert 启发式计算 ---
-    def _get_raibert_theta_target(self, current_vx):
-        # Raibert 足端落点公式: x_f = (vx * Ts)/2 + k*(vx - v_des)
-        # 我们希望 vx 保持在 v_des 附近
-        xf = (current_vx * self.Ts) / 2.0 + self.k_r * (current_vx - self.v_des)
-
-        # 几何关系: sin(theta) = xf / l0
-        # 限制 xf 不超过腿长
-        ratio = np.clip(xf / self.l0, -0.9, 0.9)
-
-        # 关键: 我们需要“后仰”(Leaning Back)，意味着脚要在重心前面 (x_foot > x_com)
-        # 在这里的坐标系中，如果 theta < 0，腿向右下偏，脚在右边（前面）。
-        # 所以 theta 应该是负的 arcsin
-        theta_target = -math.asin(ratio)
-        return theta_target
 
     def beam_endpoints(self):
         cx, cy, theta = float(self.q[0]), float(self.q[1]), float(self.q[2])
@@ -89,9 +80,17 @@ class TJumpEnvFlight2DOF:
 
     def _compute_dynamics(self, action):
         x, y, theta, l = [float(v) for v in self.q]
+
+        # --- 动作处理 ---
+        # 假设 action 是连续值 [-1, 1] 或类似的范围
+        # 我们将其截断到 [0, 1] 范围来模拟推力比例 (0% 到 100%)
+        # 或者如果你想要 Bang-Bang 控制，可以做 round。这里使用连续推力。
+        a1 = np.clip(float(action[0]), 0.0, 1.0)
+        a2 = np.clip(float(action[1]), 0.0, 1.0)
+
         if self.thrust_on:
-            F1 = self.thrust * float(action[0])
-            F2 = self.thrust * float(action[1])
+            F1 = self.thrust * a1
+            F2 = self.thrust * a2
         else:
             F1, F2 = 0.0, 0.0
 
@@ -121,122 +120,155 @@ class TJumpEnvFlight2DOF:
             ddq = np.zeros(4)
         return ddq
 
-    def step(self, action):
-        x0, y0, theta0 = self.q[0], self.q[1], self.q[2]
-        vx, vy, dtheta = self.dq[0], self.dq[1], self.dq[2]
-        v0_sq_curr = vx ** 2 + vy ** 2
+    def _compute_time_to_impact(self, y0, dy0):
+        if y0 < 0: return 0.0
+        disc = dy0 ** 2 + 2 * self.g * y0
+        if disc < 0: return 0.0
+        t_impact = (dy0 + np.sqrt(disc)) / self.g
+        return t_impact
 
-        # 1. 弹道计算 (Ballistics)
+    def step(self, action):
+        # 1. 实时计算弹道需求
+        x0, y0, theta0 = self.q[0], self.q[1], self.q[2]
+        dx0, dy0, dtheta0 = self.dq[0], self.dq[1], self.dq[2]
+
         dx_target = self.target_x - x0
         dy_target = 0.0 - y0
+
         cos_th = math.cos(theta0)
         tan_th = math.tan(theta0)
         denom = 2 * (cos_th ** 2) * (dx_target * tan_th - dy_target)
+        v0_sq_curr = dx0 ** 2 + dy0 ** 2
 
         v_req_sq = -1.0
         if denom > 1e-4 and dx_target > 0:
             v_req_sq = (self.g * (dx_target ** 2)) / denom
 
-        # 2. Raibert 姿态计算
-        # 计算理想的落地角度 (Leaning Back)
-        raibert_theta_target = self._get_raibert_theta_target(vx)
+        # --- Raibert Attitude ---
+        t_rem = self._compute_time_to_impact(y0, dy0)
 
-        # 3. 预测落地时的实际角度
-        # 估算剩余飞行时间 t_rem (只考虑重力影响的简单抛物线)
-        # y(t) = y0 + vy*t - 0.5*g*t^2 = 0
-        delta = vy ** 2 + 2 * self.g * y0
-        t_rem = 0.0
-        if delta >= 0:
-            t_rem = (vy + math.sqrt(delta)) / self.g
+        Ts = 0.25
+        k_speed = 0.1
+        vx_current = dx0
+        vx_desired = 1.0
 
-        # 预测落地角度 (假设角速度不变，因为关机后力矩为0)
-        pred_theta_land = theta0 + dtheta * t_rem
+        foot_offset_x = (vx_current * Ts / 2.0) + k_speed * (vx_current - vx_desired)
+        foot_offset_x = np.clip(foot_offset_x, -0.2, 0.2)
 
-        # 4. 锁定逻辑 (Lock Logic)
+        if self.l0 > 1e-3:
+            theta_land_raibert = -math.asin(foot_offset_x / self.l0)
+        else:
+            theta_land_raibert = 0.0
+
+        dtheta_req = 0.0
+        if t_rem > 0.05:
+            dtheta_req = (theta_land_raibert - theta0) / t_rem
+        else:
+            dtheta_req = dtheta0
+
+        # --- 2. 锁定逻辑判定 ---
         if self.thrust_on:
             dist_sq = x0 ** 2 + y0 ** 2
+            v0_curr = math.sqrt(v0_sq_curr) if v0_sq_curr > 0 else 0
+            v_req = math.sqrt(v_req_sq) if v_req_sq > 0 else 0
+
             cond_pos = (self.r_sq < dist_sq < self.R_sq)
             cond_ang = (self.angle_min_rad < theta0 < self.angle_max_rad)
-            cond_vel = (v_req_sq > 0) and (abs(v0_sq_curr - v_req_sq) < 0.5)
+            cond_vel = (v_req_sq > 0) and (abs(v0_curr - v_req) < 0.5)
+            cond_omega = abs(dtheta0 - dtheta_req) < 1.0
 
-            # [新增] 姿态锁定条件: 预测的落地角度必须接近 Raibert 目标
-            # 我们稍微放宽一点容忍度，让 PPO 容易学到 (例如 +/- 15度)
-            cond_att = abs(pred_theta_land - raibert_theta_target) < math.radians(15)
-
-            if cond_pos and cond_ang and cond_vel and cond_att:
+            if cond_pos and cond_ang and cond_vel and cond_omega:
                 self.thrust_on = False
-                print(
-                    f"🔒 LOCKED! v={math.sqrt(v0_sq_curr):.2f}, θ_land_pred={math.degrees(pred_theta_land):.1f}°, Target={math.degrees(raibert_theta_target):.1f}°")
+                print(f"🔒 LOCK [Raibert]: x={x0:.2f}, v_err={abs(v0_sq_curr - v_req_sq):.2f}, "
+                      f"Ang_Tgt={math.degrees(theta_land_raibert):.1f}°, w_err={abs(dtheta0 - dtheta_req):.2f}")
 
+        # 如果 thrust 关机，强制 action 为 0
         if not self.thrust_on:
-            action = [0, 0]
+            # 即使网络输出是非零，物理上也强制为0
+            # 这里我们传入网络原始输出给 _compute_dynamics，但在那里我们通过 if self.thrust_on 控制力
+            pass
 
-        # 5. 物理积分
+            # --- 3. 物理步进 ---
         ddq = self._compute_dynamics(action)
         self.dq += ddq * self.dt
         self.q += self.dq * self.dt
         self.q[2] = (self.q[2] + math.pi) % (2 * math.pi) - math.pi
         self.steps += 1
 
-        # 6. Reward Calculation
+        # --- 4. 奖励计算 ---
         reward = 0.0
         done = False
         landed = False
 
         if self.thrust_on:
             reward -= 0.01
-            # A. 速度引导
+            # 动作惩罚 (节省燃料)
+            reward -= 0.005 * (np.sum(np.square(action)))
+
             if v_req_sq > 0:
-                reward += 2.0 * np.exp(-5.0 * abs(v0_sq_curr - v_req_sq))
+                v_err = abs(v0_sq_curr - v_req_sq)
+                # 使用较平缓的奖励梯度，避免梯度消失
+                reward += 2.0 * np.exp(-2.0 * v_err)
             else:
                 reward -= 0.1
 
-            # B. [新增] 姿态引导 (Attitude Guidance)
-            # 鼓励现在的状态能导致正确的落地姿态
-            att_err = abs(pred_theta_land - raibert_theta_target)
-            reward += 1.5 * np.exp(-5.0 * att_err)
+            if t_rem > 0.05:
+                w_err = abs(dtheta0 - dtheta_req)
+                reward += 1.0 * np.exp(-2.0 * w_err)
+
+            if not (self.angle_min_rad < theta0 < self.angle_max_rad):
+                reward -= 0.1
 
         else:
             reward -= 0.001
 
-        # Check Landing
         if self.q[1] <= 0.0:
             done = True
             landed = True
             self.q[1] = 0.0
-        elif self.steps >= self.max_steps or abs(self.q[2]) > np.pi / 2:
+        elif self.steps >= self.max_steps:
+            done = True
+        elif abs(self.q[2]) > np.pi:
             done = True
             reward -= 10.0
 
         if landed:
-            # 落地精度奖励
             dist_error = abs(self.q[0] - self.target_x)
             if dist_error < 0.2:
                 reward += 20.0
+            elif dist_error < 1.0:
+                reward += (1.0 - dist_error) * 5.0
             else:
                 reward -= dist_error * 2.0
 
-            # [新增] 落地姿态最终奖励
-            final_att_err = abs(self.q[2] - raibert_theta_target)
-            if final_att_err < math.radians(10):
-                reward += 10.0  # 完美姿态落地
+            final_foot_offset = (self.dq[0] * Ts / 2.0) + k_speed * (self.dq[0] - 1.0)
+            final_foot_offset = np.clip(final_foot_offset, -0.2, 0.2)
+            ideal_land_theta = -math.asin(final_foot_offset / self.l0)
+
+            angle_error = abs(self.q[2] - ideal_land_theta)
+            if angle_error < 0.2:
+                reward += 10.0
             else:
-                reward -= 5.0 * final_att_err
+                reward -= angle_error * 5.0
 
         info = {"dq": self.dq, "ddq": ddq, "thrust_on": self.thrust_on}
         return self._obs(), float(reward), done, info
 
+
+# --- PPO Network (Continuous) ---
 if torch is not None:
     class ActorCritic(nn.Module):
-        def __init__(self, obs_dim=4, hidden=512):
+        def __init__(self, obs_dim=6, hidden=256):  # Obs dim changed to 6
             super().__init__()
-            self.actor = nn.Sequential(
+            self.actor_mean = nn.Sequential(
                 nn.Linear(obs_dim, hidden),
                 nn.Tanh(),
                 nn.Linear(hidden, hidden),
                 nn.Tanh(),
-                nn.Linear(hidden, 2)
+                nn.Linear(hidden, 2),  # Output 2 actions
+                nn.Tanh()  # Tanh to force range [-1, 1], we map to [0, 1] later
             )
+            self.log_std = nn.Parameter(torch.zeros(2) - 0.5)  # Initialize with small std
             self.critic = nn.Sequential(
                 nn.Linear(obs_dim, hidden),
                 nn.Tanh(),
@@ -244,19 +276,18 @@ if torch is not None:
                 nn.Tanh(),
                 nn.Linear(hidden, 1)
             )
-            # Initialize weights to prevent large initial outputs
-            self._initialize_weights()
+
+        def forward(self, x):
+            mean = self.actor_mean(x)
+            std = torch.exp(self.log_std)
+            value = self.critic(x).squeeze(-1)
+            return mean, std, value
 
         def _initialize_weights(self):
             for m in self.modules():
                 if isinstance(m, nn.Linear):
                     nn.init.xavier_uniform_(m.weight)
                     nn.init.constant_(m.bias, 0.0)
-
-        def forward(self, x):
-            logits = self.actor(x)
-            value = self.critic(x).squeeze(-1)
-            return logits, value
 
 
 def compute_gae(rewards, values, dones, gamma=0.995, lam=0.95):
@@ -289,10 +320,11 @@ def train_ppo(env,
               clip_eps=0.2,
               lr=3e-4,
               policy_net=None,
-              model_path="ppo_jumping_robot.pt"):
+              model_path="ppo_jumping_robot_raibert.pt"):
+    # 修正: obs_dim=6
     if policy_net is None:
-        net = ActorCritic(obs_dim=4).to(device)
-        print("创建新的 PPO 策略网络")
+        net = ActorCritic(obs_dim=6).to(device)
+        print("创建新的 PPO 策略网络 (Continuous)")
     else:
         net = policy_net
         print("继续训练已有 PPO 策略网络")
@@ -300,7 +332,6 @@ def train_ppo(env,
     opt = optim.Adam(net.parameters(), lr=lr)
     all_rewards = []
     best_avg = -1e9
-    best_state = None
 
     for update in range(num_updates):
         obs_buf, act_buf, logp_buf, rew_buf, val_buf, done_buf = [], [], [], [], [], []
@@ -312,19 +343,24 @@ def train_ppo(env,
             ep_r = 0.0
             while not done and steps < batch_size:
                 o = torch.tensor(obs, dtype=torch.float32, device=device).unsqueeze(0)
-                if torch.any(torch.isnan(o)) or torch.any(torch.isinf(o)):
-                    print("Warning: NaN or inf in observation input to network:", o)
-                    break
-                logits, v = net(o)
-                if torch.any(torch.isnan(logits)) or torch.any(torch.isinf(logits)):
-                    print("Warning: NaN or inf in logits:", logits)
-                    break
-                logits = logits.squeeze(0)
-                v = v.item()
-                dist = torch.distributions.Bernoulli(logits=logits)
-                action = dist.sample().cpu().numpy().astype(np.float32)
-                logp = dist.log_prob(torch.tensor(action, dtype=torch.float32, device=device)).sum().item()
 
+                # --- 修正: 连续动作采样 ---
+                # 解包 mean, std, value
+                mean, std, v = net(o)
+                mean = mean.squeeze(0)
+                std = std.squeeze(0)  # or just use std directly since it's parameter broadcast
+                v = v.item()
+
+                dist = torch.distributions.Normal(mean, std)
+                action_tensor = dist.sample()
+
+                # 计算 log_prob
+                logp = dist.log_prob(action_tensor).sum().item()
+
+                # 转为 numpy 传入 env
+                action = action_tensor.cpu().numpy()
+
+                # Env Step (Environment handles clamping/interpretation)
                 next_obs, r, done, info = env.step(action)
 
                 obs_buf.append(obs.copy())
@@ -360,8 +396,10 @@ def train_ppo(env,
                 ad = torch.tensor(advs[mb], dtype=torch.float32, device=device)
                 rt = torch.tensor(returns[mb], dtype=torch.float32, device=device)
 
-                logits, val = net(o)
-                dist = torch.distributions.Bernoulli(logits=logits)
+                # --- 修正: 连续动作 Update ---
+                mean, std, val = net(o)
+                dist = torch.distributions.Normal(mean, std)
+
                 new_logp = dist.log_prob(a).sum(dim=-1)
                 ratio = torch.exp(new_logp - ol)
                 s1 = ratio * ad
@@ -370,7 +408,7 @@ def train_ppo(env,
                 value_loss = torch.mean((rt - val) ** 2)
                 entropy = torch.mean(dist.entropy().sum(dim=-1))
 
-                loss = policy_loss + 0.5 * value_loss - 0.05 * entropy
+                loss = policy_loss + 0.5 * value_loss - 0.01 * entropy
                 opt.zero_grad()
                 loss.backward()
                 torch.nn.utils.clip_grad_norm_(net.parameters(), 0.5)
@@ -388,7 +426,7 @@ def train_ppo(env,
     return net, all_rewards, best_avg
 
 
-def rollout_and_render(env, policy_net=None, device=None, max_steps=400, deterministic=False, save_gif=True):
+def rollout_and_render(env, policy_net=None, device=None, max_steps=400, deterministic=True, save_gif=True):
     frames = []
     px, py = [], []
 
@@ -398,15 +436,23 @@ def rollout_and_render(env, policy_net=None, device=None, max_steps=400, determi
 
     while not done and steps < max_steps:
         if policy_net is None:
-            action = np.random.binomial(1, 0.5, size=(2,))
+            action = np.random.uniform(0, 1, size=(2,))
         else:
             o = torch.tensor(obs, dtype=torch.float32, device=device).unsqueeze(0)
             with torch.no_grad():
-                logits, _ = policy_net(o)
-            p = torch.sigmoid(logits).squeeze(0).cpu().numpy()
-            action = (p > 0.5).astype(np.int32) if deterministic else np.random.binomial(1, p).astype(np.int32)
+                mean, std, _ = policy_net(o)
 
+            if deterministic:
+                # 确定性模式：直接取 mean
+                action = mean.squeeze(0).cpu().numpy()
+            else:
+                # 随机模式：采样
+                dist = torch.distributions.Normal(mean, std)
+                action = dist.sample().squeeze(0).cpu().numpy()
+
+        # Step
         obs, r, done, info = env.step(action)
+
         x, y, th = env.q[0], env.q[1], env.q[2]
         left, right = env.beam_endpoints()
         tip = (x + math.sin(th) * env.l0, y + math.cos(th) * env.l0)
@@ -426,91 +472,102 @@ def rollout_and_render(env, policy_net=None, device=None, max_steps=400, determi
 
     fig, ax = plt.subplots(figsize=(10, 8))
     ax.set_aspect('equal')
-    ax.set_title("Jumping Robot 2D Simulation")
+    ax.set_title("Jumping Robot - Continuous Control")
     ax.set_xlim(-1.0, 4)
     ax.set_ylim(0.0, 2.0)
     ax.grid(True, alpha=0.3)
 
-    # Target Box (representing the constraint r < |x0, y0| < R)
-    target_circle = plt.Circle((0, 0), np.sqrt(env.R_sq), color='red', fill=False, linestyle='--', linewidth=1,
-                               alpha=0.3, label='$R$ boundary')
+    target_circle = plt.Circle((0, 0), np.sqrt(env.R_sq), color='red', fill=False, linestyle='--', linewidth=1)
     ax.add_patch(target_circle)
-    inner_circle = plt.Circle((0, 0), np.sqrt(env.r_sq), color='red', fill=False, linestyle='--', linewidth=1,
-                              alpha=0.3, label='$r$ boundary')
+    inner_circle = plt.Circle((0, 0), np.sqrt(env.r_sq), color='red', fill=False, linestyle='--', linewidth=1)
     ax.add_patch(inner_circle)
 
     beam_line, = ax.plot([], [], lw=3, label='Beam', color='black')
     leg_line, = ax.plot([], [], lw=3, label='Leg', color='black')
-    com_point_m1, = ax.plot([], [], 'ko', markersize=4, label='Body COM')
-    com_point_m2, = ax.plot([], [], 'ko', markersize=4, label='Leg COM')
-    left_dot, = ax.plot([], [], 'o', markersize=5)   # beam 左端点
-    right_dot, = ax.plot([], [], 'o', markersize=5)  # beam 右端点
-    path_line, = ax.plot([], [], 'g--', lw=1, alpha=0.7, label='Trajectory')
-    ground_line, = ax.plot([-1, 4], [0, 0], 'k-', lw=2, label='Ground')
-    target_point, = ax.plot([env.target_x], [0], 'gX', markersize=12, label='Target')
+    left_dot, = ax.plot([], [], 'o', markersize=5)
+    right_dot, = ax.plot([], [], 'o', markersize=5)
+    path_line, = ax.plot([], [], 'g--', lw=1, alpha=0.7)
+    ax.plot([-1, 4], [0, 0], 'k-', lw=2)
+    ax.plot([env.target_x], [0], 'gX', markersize=12)
     info_text = ax.text(0.02, 0.95, "", transform=ax.transAxes, fontsize=10,
                         bbox=dict(boxstyle="round,pad=0.3", facecolor="white", alpha=0.8))
-    ax.legend(loc='upper right')
 
     def init():
         beam_line.set_data([], [])
         leg_line.set_data([], [])
-        com_point_m2.set_data([], [])
-        com_point_m1.set_data([], [])
         left_dot.set_data([], [])
         right_dot.set_data([], [])
         path_line.set_data([], [])
         info_text.set_text("")
-        return beam_line, leg_line, com_point_m2, com_point_m1, left_dot, right_dot, path_line, info_text
+        return beam_line, leg_line, left_dot, right_dot, path_line, info_text
 
     def animate(i):
-        if i >= len(frames):
-            return init()
+        if i >= len(frames): return init()
         frame = frames[i]
         x, y, th = frame['x'], frame['y'], frame['th']
         left, right, tip = frame['left'], frame['right'], frame['tip']
         action = frame['action']
 
-        # beam & leg
+        # Clip action for color display to 0-1 (even if physics allowed <0)
+        a_disp = np.clip(action, 0, 1)
+
         beam_line.set_data([left[0], right[0]], [left[1], right[1]])
         leg_line.set_data([x, tip[0]], [y, tip[1]])
-        com_point_m2.set_data([x], [y])
-        com_point_m1.set_data([tip[0]], [tip[1]])
         path_line.set_data(px[:i + 1], py[:i + 1])
 
-        # 左端点：action[0]
         left_dot.set_data([left[0]], [left[1]])
-        left_dot.set_color('blue' if action[0] == 0 else 'red')
+        left_dot.set_color(plt.cm.coolwarm(a_disp[0]))  # Color by thrust intensity
 
-        # 右端点：action[1]
         right_dot.set_data([right[0]], [right[1]])
-        right_dot.set_color('blue' if action[1] == 0 else 'red')
+        right_dot.set_color(plt.cm.coolwarm(a_disp[1]))
 
-        # info text
         info_text.set_text(
             f"Step: {frame['step']}\n"
-            f"Action: {frame['action']}\n"
-            f"Position: ({x:.2f}, {y:.2f})\n"
-            f"Theta: {math.degrees(th):.1f}°\n"
-            f"Velocity: ({frame['dq'][0]:.2f}, {frame['dq'][1]:.2f})"
+            f"Action: [{action[0]:.2f}, {action[1]:.2f}]\n"
+            f"Pos: ({x:.2f}, {y:.2f})\n"
+            f"Vel: ({frame['dq'][0]:.2f}, {frame['dq'][1]:.2f})"
         )
-        return beam_line, leg_line, com_point_m2, com_point_m1, left_dot, right_dot, path_line, info_text
+        return beam_line, leg_line, left_dot, right_dot, path_line, info_text
 
     ani = FuncAnimation(fig, animate, frames=len(frames), init_func=init,
                         interval=50, blit=True, repeat=False)
 
     if save_gif:
-        print("Saving animation as GIF...")
-        ani.save('jumping_robot_simulation_ground.gif', writer=PillowWriter(fps=20))
-        print("GIF saved as 'jumping_robot_simulation_ground.gif'")
+        ani.save('jumping_robot_raibert_continuous.gif', writer=PillowWriter(fps=20))
 
     plt.tight_layout()
     plt.show()
     return ani
 
 
-# PPO (Bernoulli heads) and helper functions (ActorCritic, compute_gae, train_ppo)
-# ... (These sections remain the same as in your original code) ...
+# if __name__ == "__main__":
+#     FORCE_TRAIN = True
+#     CONTINUE_TRAIN = False
+#     MODEL_PATH = "ppo_jumping_robot_raibert.pt"
+#     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+#
+#     env = TJumpEnvFlight2DOF()
+#
+#     # 训练
+#     if FORCE_TRAIN:
+#         print("Starting training...")
+#         # obs_dim 必须是 6
+#         net, rewards, best_avg = train_ppo(env, device, num_updates=3000, model_path=MODEL_PATH)
+#
+#         # 绘图
+#         plt.figure()
+#         plt.plot(rewards)
+#         plt.title("Learning Curve")
+#         plt.savefig("learning_curve.png")
+#         plt.show()
+#
+#     # 演示
+#     print("Simulating...")
+#     net = ActorCritic(obs_dim=6).to(device)
+#     net.load_state_dict(torch.load(MODEL_PATH, map_location=device, weights_only=True))
+#     net.eval()
+#     rollout_and_render(env, policy_net=net, device=device, deterministic=True)
+
 
 # ----------------------------------------------------------------------
 # Main Execution Block
@@ -521,8 +578,6 @@ if __name__ == "__main__":
     MODEL_PATH = "ppo_jumping_robot.pt"
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
-    # Configure the Environment with new parameters
     env = TJumpEnvFlight2DOF(
         dt=0.005,
         m1=0.0363, m2=0.01, Jm=0.02, lc=0.25, l0=0.50, g=9.81, thrust=0.314,
@@ -538,26 +593,45 @@ if __name__ == "__main__":
     )
 
     policy_net = None
+    rewards = []  # 保存训练过程中的奖励
 
-    # --- Training/Loading Logic ---
     if FORCE_TRAIN or not os.path.exists(MODEL_PATH):
-        # Start a new training
-        policy_net = ActorCritic(obs_dim=4).to(device)
         print("Start a new training...")
-        train_ppo(env, device, num_updates=3000, lr=3e-4, model_path=MODEL_PATH)
+        policy_net, rewards, best_avg = train_ppo(
+            env, device,
+            num_updates=3000,
+            batch_size=2000,
+            epochs=4,
+            minibatch_size=1000,
+            gamma=0.995, lam=0.96,
+            clip_eps=0.2,
+            lr=3e-4,
+            model_path=MODEL_PATH
+        )
+        print(f"Training completed, best average reward = {best_avg:.2f}")
 
     elif CONTINUE_TRAIN:
-        # Load and continue training
         print(f"Load an existing model and continue training: {MODEL_PATH}")
         policy_net = ActorCritic(obs_dim=4).to(device)
         policy_net.load_state_dict(torch.load(
             MODEL_PATH, map_location=device, weights_only=True
         ))
         policy_net.train()
-        train_ppo(env, device, num_updates=2000, lr=1e-4, policy_net=policy_net, model_path=MODEL_PATH)
+        policy_net, rewards, best_avg = train_ppo(
+            env, device,
+            num_updates=2000,
+            batch_size=1000,
+            epochs=4,
+            minibatch_size=512,
+            gamma=0.995, lam=0.95,
+            clip_eps=0.2,
+            lr=1e-4,
+            policy_net=policy_net,
+            model_path=MODEL_PATH
+        )
+        print(f"Continued training finish, best average reward = {best_avg:.2f}")
 
     else:
-        # Load for inference
         print(f"Load the best existing model for inference: {MODEL_PATH}")
         policy_net = ActorCritic(obs_dim=4).to(device)
         policy_net.load_state_dict(torch.load(
@@ -565,6 +639,74 @@ if __name__ == "__main__":
         ))
         policy_net.eval()
 
-    # --- Run Simulation ---
+
+    # 绘制学习曲线
+    def plot_learning_curve(rewards, model_path="ppo_jumping_robot.pt"):
+        if not rewards:
+            print("No rewards data to plot.")
+            return
+
+        # 计算移动平均（例如最近100个episode）
+        window = 100
+        if len(rewards) < window:
+            window = len(rewards)
+
+        # 移动平均
+        rewards_np = np.array(rewards)
+        moving_avg = np.convolve(rewards_np, np.ones(window) / window, mode='valid')
+
+        plt.figure(figsize=(12, 6))
+
+        # 绘制原始奖励
+        plt.subplot(1, 2, 1)
+        plt.plot(rewards_np, alpha=0.3, color='blue', label='Episode Reward')
+        plt.plot(np.arange(window - 1, len(rewards_np)), moving_avg, color='red', lw=2,
+                 label=f'Moving Average ({window} episodes)')
+        plt.xlabel('Episode')
+        plt.ylabel('Total Reward')
+        plt.title('PPO Learning Curve - Raw Rewards')
+        plt.grid(True, alpha=0.3)
+        plt.legend()
+
+        # 绘制平滑后的奖励
+        plt.subplot(1, 2, 2)
+        # 使用更大的窗口进行平滑
+        smooth_window = min(50, len(rewards) // 10)
+        if smooth_window > 1:
+            smooth_rewards = np.convolve(rewards_np, np.ones(smooth_window) / smooth_window, mode='valid')
+            plt.plot(np.arange(smooth_window - 1, len(rewards_np)), smooth_rewards, color='green', lw=2,
+                     label=f'Smoothed ({smooth_window} episodes)')
+        plt.plot(rewards_np, alpha=0.2, color='blue')
+        plt.xlabel('Episode')
+        plt.ylabel('Smoothed Reward')
+        plt.title('PPO Learning Curve - Smoothed')
+        plt.grid(True, alpha=0.3)
+        plt.legend()
+
+        plt.tight_layout()
+
+        # 保存图像
+        plot_filename = os.path.splitext(model_path)[0] + "_learning_curve.png"
+        plt.savefig(plot_filename, dpi=300, bbox_inches='tight')
+        print(f"Learning curve saved as {plot_filename}")
+
+        # 显示统计信息
+        print(f"\nTraining Statistics:")
+        print(f"Total episodes: {len(rewards)}")
+        print(f"Final reward: {rewards[-1]:.2f}")
+        print(f"Best reward: {np.max(rewards):.2f}")
+        print(f"Average reward: {np.mean(rewards):.2f} ± {np.std(rewards):.2f}")
+        print(f"Last {window} episodes average: {np.mean(rewards[-window:]):.2f}")
+
+        plt.show()
+
+
+    # 调用学习曲线绘制函数
+    if rewards:  # 只有在有训练数据时才绘制
+        plot_learning_curve(rewards, MODEL_PATH)
+    else:
+        print("No training rewards data available for plotting.")
+
+    # 进行演示
     rollout_and_render(env, policy_net=policy_net, device=device,
                        deterministic=True, save_gif=True)

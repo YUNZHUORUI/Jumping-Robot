@@ -54,9 +54,11 @@ class TJumpEnvFlight2DOF:
         return self._obs()
 
     def _obs(self):
-        # Simple Observation: Velocity and Angle
-        # (PPO must learn to infer position relative to target based on rewards, or we can add position later)
-        obs = np.array([self.dq[0], self.dq[1], self.dq[2], self.q[2]], dtype=np.float32)
+        obs = np.array([
+            self.q[0], self.q[1],  # x, y (Crucial for learning position constraints)
+            self.dq[0], self.dq[1],  # dx, dy
+            self.dq[2], self.q[2]  # dtheta, theta
+        ], dtype=np.float32)
         return obs
 
     def beam_endpoints(self):
@@ -222,7 +224,7 @@ class TJumpEnvFlight2DOF:
 # PPO (Bernoulli heads)
 if torch is not None:
     class ActorCritic(nn.Module):
-        def __init__(self, obs_dim=4, hidden=512):
+        def __init__(self, obs_dim=6, hidden=256):
             super().__init__()
             self.actor = nn.Sequential(
                 nn.Linear(obs_dim, hidden),
@@ -285,7 +287,7 @@ def train_ppo(env,
               policy_net=None,
               model_path="ppo_jumping_robot.pt"):
     if policy_net is None:
-        net = ActorCritic(obs_dim=4).to(device)
+        net = ActorCritic(obs_dim=6).to(device)
         print("创建新的 PPO 策略网络")
     else:
         net = policy_net
@@ -515,45 +517,127 @@ if __name__ == "__main__":
     MODEL_PATH = "ppo_jumping_robot.pt"
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
-    # Configure the Environment with new parameters
     env = TJumpEnvFlight2DOF(
-        dt=0.005, m1=0.0363, m2=0.01, Jm=0.02,
-        lc=0.25, l0=0.50, g=9.81, thrust=0.314,
-        max_steps=400, target_x=2.0, target_theta=-np.pi/7,  # Changed target_x for variety
-        # Configure the Ballistic Launch Zone
-        r_sq=0.5 ** 2, R_sq=1.5 ** 2,
-        theta_min_deg=30, theta_max_deg=60
+        dt=0.005, m1=0.2, m2=0.1, Jm=0.02,
+        lc=0.5, l0=1.0, g=9.81, thrust=1.0,
+        max_steps=350, target_x=2, target_theta=-np.pi / 7
     )
 
     policy_net = None
+    rewards = []  # 保存训练过程中的奖励
 
-    # --- Training/Loading Logic ---
     if FORCE_TRAIN or not os.path.exists(MODEL_PATH):
-        # Start a new training
-        policy_net = ActorCritic(obs_dim=4).to(device)
         print("Start a new training...")
-        train_ppo(env, device, num_updates=3000, lr=3e-4, model_path=MODEL_PATH)
+        policy_net, rewards, best_avg = train_ppo(
+            env, device,
+            num_updates=3000,
+            batch_size=2000,
+            epochs=4,
+            minibatch_size=1000,
+            gamma=0.995, lam=0.96,
+            clip_eps=0.2,
+            lr=3e-4,
+            model_path=MODEL_PATH
+        )
+        print(f"Training completed, best average reward = {best_avg:.2f}")
 
     elif CONTINUE_TRAIN:
-        # Load and continue training
         print(f"Load an existing model and continue training: {MODEL_PATH}")
-        policy_net = ActorCritic(obs_dim=4).to(device)
+        policy_net = ActorCritic(obs_dim=6).to(device)
         policy_net.load_state_dict(torch.load(
             MODEL_PATH, map_location=device, weights_only=True
         ))
         policy_net.train()
-        train_ppo(env, device, num_updates=2000, lr=1e-4, policy_net=policy_net, model_path=MODEL_PATH)
+        policy_net, rewards, best_avg = train_ppo(
+            env, device,
+            num_updates=2000,
+            batch_size=1000,
+            epochs=4,
+            minibatch_size=512,
+            gamma=0.995, lam=0.95,
+            clip_eps=0.2,
+            lr=1e-4,
+            policy_net=policy_net,
+            model_path=MODEL_PATH
+        )
+        print(f"Continued training finish, best average reward = {best_avg:.2f}")
 
     else:
-        # Load for inference
         print(f"Load the best existing model for inference: {MODEL_PATH}")
-        policy_net = ActorCritic(obs_dim=4).to(device)
+        policy_net = ActorCritic(obs_dim=6).to(device)
         policy_net.load_state_dict(torch.load(
             MODEL_PATH, map_location=device, weights_only=True
         ))
         policy_net.eval()
 
-    # --- Run Simulation ---
+
+    # 绘制学习曲线
+    def plot_learning_curve(rewards, model_path="ppo_jumping_robot.pt"):
+        if not rewards:
+            print("No rewards data to plot.")
+            return
+
+        # 计算移动平均（例如最近100个episode）
+        window = 100
+        if len(rewards) < window:
+            window = len(rewards)
+
+        # 移动平均
+        rewards_np = np.array(rewards)
+        moving_avg = np.convolve(rewards_np, np.ones(window) / window, mode='valid')
+
+        plt.figure(figsize=(12, 6))
+
+        # 绘制原始奖励
+        plt.subplot(1, 2, 1)
+        plt.plot(rewards_np, alpha=0.3, color='blue', label='Episode Reward')
+        plt.plot(np.arange(window - 1, len(rewards_np)), moving_avg, color='red', lw=2,
+                 label=f'Moving Average ({window} episodes)')
+        plt.xlabel('Episode')
+        plt.ylabel('Total Reward')
+        plt.title('PPO Learning Curve - Raw Rewards')
+        plt.grid(True, alpha=0.3)
+        plt.legend()
+
+        # 绘制平滑后的奖励
+        plt.subplot(1, 2, 2)
+        # 使用更大的窗口进行平滑
+        smooth_window = min(50, len(rewards) // 10)
+        if smooth_window > 1:
+            smooth_rewards = np.convolve(rewards_np, np.ones(smooth_window) / smooth_window, mode='valid')
+            plt.plot(np.arange(smooth_window - 1, len(rewards_np)), smooth_rewards, color='green', lw=2,
+                     label=f'Smoothed ({smooth_window} episodes)')
+        plt.plot(rewards_np, alpha=0.2, color='blue')
+        plt.xlabel('Episode')
+        plt.ylabel('Smoothed Reward')
+        plt.title('PPO Learning Curve - Smoothed')
+        plt.grid(True, alpha=0.3)
+        plt.legend()
+
+        plt.tight_layout()
+
+        # 保存图像
+        plot_filename = os.path.splitext(model_path)[0] + "_learning_curve.png"
+        plt.savefig(plot_filename, dpi=300, bbox_inches='tight')
+        print(f"Learning curve saved as {plot_filename}")
+
+        # 显示统计信息
+        print(f"\nTraining Statistics:")
+        print(f"Total episodes: {len(rewards)}")
+        print(f"Final reward: {rewards[-1]:.2f}")
+        print(f"Best reward: {np.max(rewards):.2f}")
+        print(f"Average reward: {np.mean(rewards):.2f} ± {np.std(rewards):.2f}")
+        print(f"Last {window} episodes average: {np.mean(rewards[-window:]):.2f}")
+
+        plt.show()
+
+
+    # 调用学习曲线绘制函数
+    if rewards:  # 只有在有训练数据时才绘制
+        plot_learning_curve(rewards, MODEL_PATH)
+    else:
+        print("No training rewards data available for plotting.")
+
+    # 进行演示
     rollout_and_render(env, policy_net=policy_net, device=device,
                        deterministic=True, save_gif=True)
