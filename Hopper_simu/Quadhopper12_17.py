@@ -497,7 +497,7 @@ def rollout_and_render(env, policy_net=None, device=None, max_steps=400, determi
 
     if save_gif:
         print("Saving animation as GIF...")
-        ani.save('jumping_robot_simulation_ground.gif', writer=PillowWriter(fps=20))
+        ani.save('jumping_robot_simulation_ground.gif', writer=PillowWriter(fps=30))
         print("GIF saved as 'jumping_robot_simulation_ground.gif'")
 
     plt.tight_layout()

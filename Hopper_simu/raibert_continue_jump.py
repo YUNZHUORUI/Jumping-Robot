@@ -11,12 +11,12 @@ import os
 class QuadhopperContinuousEnv:
     def __init__(self,
                  dt=0.005,
-                 m_body=0.5,  # 机身质量
+                 m_body=0.05,  # 机身质量
                  l_leg=0.50,  # 腿长
                  lc=0.25,  # 机臂长度 (电机到中心距离)
                  J_body=0.05,  # 转动惯量
                  g=9.81,
-                 max_thrust=15.0,  # 最大推力 (N)
+                 max_thrust=0.314,  # 最大推力 (N)
                  target_dx=1.0,  # 目标前进速度 (m/s)
                  ground_y=0.0):  # 地面高度
 
@@ -35,7 +35,7 @@ class QuadhopperContinuousEnv:
     def reset(self):
         # 初始状态: [x, y, theta, l]
         # 从空中开始，稍微给一点初速度
-        self.q = np.array([0.0, 1.2, 0.05, self.l0], dtype=np.float64)
+        self.q = np.array([0.0, 0.2, 0.05, self.l0], dtype=np.float64)
         # 初始速度: [dx, dy, dtheta, dl]
         self.dq = np.array([0.5, 0.0, 0.0, 0.0], dtype=np.float64)
 
@@ -245,9 +245,9 @@ def run_simulation():
     ground, = ax.plot([-10, 20], [0, 0], 'k-', lw=2)
     body_line, = ax.plot([], [], 'k-', lw=3)  # 机臂
     leg_line, = ax.plot([], [], 'b-', lw=2)  # 腿
-    foot_dot, = ax.plot([], [], 'ro', markersize=6)
-    prop_l, = ax.plot([], [], 'g^', markersize=8)  # 左桨
-    prop_r, = ax.plot([], [], 'g^', markersize=8)  # 右桨
+    foot_dot, = ax.plot([], [], 'ro', markersize=4)
+    prop_l, = ax.plot([], [], 'go', markersize=4)  # 左桨
+    prop_r, = ax.plot([], [], 'go', markersize=4)  # 右桨
     info_text = ax.text(0.05, 0.9, "", transform=ax.transAxes)
 
     def init():

@@ -1,589 +1,367 @@
 import math
 import numpy as np
-import matplotlib.pyplot as plt
-from matplotlib.animation import FuncAnimation, PillowWriter
-import matplotlib.patches as patches
-import torch
-import torch.nn as nn
-import torch.optim as optim
+import gymnasium as gym
+from gymnasium import spaces
+from stable_baselines3 import PPO
+from stable_baselines3.common.vec_env import DummyVecEnv, SubprocVecEnv
+from stable_baselines3.common.env_util import make_vec_env
+from stable_baselines3.common.callbacks import EvalCallback, StopTrainingOnRewardThreshold
+from stable_baselines3.common.env_checker import check_env
+import torch as th
+from multiprocessing import freeze_support  # Windows 需要这个，但 macOS 无害
 import os
 
+class QuadhopperTargetEnv(gym.Env):
+    metadata = {"render_modes": ["human", "rgb_array"], "render_fps": 30}
+    def __init__(self, render_mode=None):
+        super().__init__()
+        self.render_mode = render_mode
 
-# ==============================================================================
-# 1. 多跳物理环境 (Physics Environment with Multi-hop & Ballistic Logic)
-# ==============================================================================
+        # ==========================================
+        # 1. 物理参数 (基于 cf2.xml 更新)
+        # ==========================================
+        self.dt = 0.005
 
-class QuadHopperMultiJumpEnv:
-    def __init__(self,
-                 dt=0.005,
-                 m1=0.0363, m2=0.01, Jm=0.02, lc=0.25, l0=0.50, g=9.81, thrust=0.314,
-                 max_steps_per_hop=600,
-                 targets=[2.0, 4.5, 7.0],  # 连续跳跃的目标点 x 坐标
-                 # --- 约束条件 ---
-                 r_inner=0.5, R_outer=1.50,
-                 launch_theta_min_deg=30, launch_theta_max_deg=60,
-                 landing_pitch_target_deg=-20.0):
+        # 质量: Body(1.1) + Foot(0.11)
+        self.m = 1.21
 
-        self.dt = float(dt)
-        self.m1, self.m2, self.Jm = float(m1), float(m2), float(Jm)
-        self.lc, self.l0 = float(lc), float(l0)
-        self.g, self.thrust = float(g), float(thrust)
-        self.max_steps = int(max_steps_per_hop)
+        # 腿长: 基于 pos="0 0 -1.0"
+        self.l0 = 1.0
 
-        # 多跳目标管理
-        self.global_targets = targets
+        # 力臂 (半宽): 基于 motor_site pos="0.1768"
+        self.lc = 0.177
+
+        # 转动惯量: 基于 diaginertia="0.15 ..."
+        self.J = 0.15
+
+        self.g = 9.81
+
+        # 推力: 单电机15N * 2 (双桨合并) = 30N
+        self.max_thrust = 30.0
+
+        # 弹簧参数 (虽然当前step用的是Raibert跳跃, 但建议存着)
+        self.k_spring = 150.0
+        self.c_damping = 1.0
+
+        self.ground_y = 0.0
+
+        # ==========================================
+        # 2. 目标与空间设置 (保持逻辑不变)
+        # ==========================================
+        # 两个固定目标 (因为腿变长了1.0m, 步幅变大，建议稍微拉远目标距离)
+        self.targets = np.array([2.0, 4.0])
+        self.target_tolerance = 0.20  # 适当放宽判定范围
+
+        # Action: 左右油门 [0,1]
+        self.action_space = spaces.Box(low=0.0, high=1.0, shape=(2,), dtype=np.float32)
+
+        # Observation
+        self.observation_space = spaces.Box(low=-np.inf, high=np.inf, shape=(10,), dtype=np.float32)
+
         self.current_target_idx = 0
-        self.landing_pitch_target = math.radians(landing_pitch_target_deg)
-
-        # 区域约束 (Ballistic Sector)
-        self.r_inner = r_inner
-        self.R_outer = R_outer
-        self.r_sq = r_inner ** 2
-        self.R_sq = R_outer ** 2
-        self.launch_theta_min = math.radians(launch_theta_min_deg)
-        self.launch_theta_max = math.radians(launch_theta_max_deg)
-        self.launch_theta_min_deg = launch_theta_min_deg
-        self.launch_theta_max_deg = launch_theta_max_deg
-
-        self.reset()
-
-    def reset(self):
-        # 完全重置环境
-        self.current_target_idx = 0
-        self.q = np.array([0.0, 0.0, 0.0, 1.0], dtype=np.float32)  # x, y, theta, l
-        self.dq = np.array([0.0, 0.0, 0.0, 0.0], dtype=np.float32)
-
-        # 初始随机扰动
-        self.q[2] = np.random.uniform(math.radians(-5), math.radians(5))
-
         self.steps = 0
-        self.flight_state = "PRE_LAUNCH"  # 状态机: PRE_LAUNCH, BALLISTIC, APEX_ADJUST, DESCENDING
-        self.current_origin_x = 0.0  # 当前跳跃的参考原点
+        self.max_episode_steps = 2000
 
-        return self._obs()
+    def reset(self, seed=None, options=None):
+        super().reset(seed=seed)
 
-    def _get_current_target_rel(self):
-        # 获取相对于当前起点的目标距离
-        if self.current_target_idx >= len(self.global_targets):
-            return 0.0
-        global_target_x = self.global_targets[self.current_target_idx]
-        return global_target_x - self.current_origin_x
+        if seed is not None:
+            np.random.seed(seed)
 
-    def _obs(self):
-        # 观测空间: [dx, dy, dtheta, theta, rel_dist_x, rel_dist_y]
-        # rel_dist_x 是 "当前位置" 到 "相对当前起点的目标" 的距离
-        target_rel_dist = self._get_current_target_rel()
-        current_rel_pos = self.q[0] - self.current_origin_x
+        # 1. 随机初始化角度 (Theta)
+        init_theta = np.random.uniform(math.radians(-60), math.radians(-30))
 
-        rel_x = target_rel_dist - current_rel_pos
-        rel_y = 0.0 - self.q[1]
+        # 2. 计算最小安全高度 (Min Safe Height)
+        # 腿完全伸直时的垂直长度 = l0 * cos(theta)
+        leg_vertical_height = self.l0 * math.cos(init_theta)
 
-        obs = np.array([self.dq[0], self.dq[1], self.dq[2], self.q[2], rel_x, rel_y], dtype=np.float32)
-        return obs
+        # 3. 随机初始化高度 (Y)
+        # 我们需要在腿长基础上，再加一点"悬空高度"，让它落下来积蓄能量
+        init_y = np.random.uniform(1.2, 1.5)
 
-    def _calculate_ballistic_velocity(self, x0, y0, theta0):
-        """
-        根据公式计算命中目标所需的初速度 v0
-        v0 = sqrt( (g * Dx^2) / (2 * cos^2(theta) * (Dx * tan(theta) - Dz)) )
-        """
-        # 计算相对于当前跳跃起点(Origin)的 Delta_x
-        # 比如 Origin=2.0, Target=4.5, 当前 x=2.5 -> Delta_x = 4.5 - 2.5 = 2.0
-        global_target = self.global_targets[self.current_target_idx] if self.current_target_idx < len(
-            self.global_targets) else self.q[0]
-        Delta_x = global_target - x0
-        Delta_z = 0.0 - y0  # 目标高度假设为 0
+        # 确保无论如何 y 都要比腿长高 (防止插地)
+        init_y = max(init_y, leg_vertical_height + 0.1)
 
-        if Delta_x <= 0.1: return -1.0  # 目标在身后或太近
-
-        cos_t = math.cos(theta0)
-        tan_t = math.tan(theta0)
-
-        denom = 2 * (cos_t ** 2) * (Delta_x * tan_t - Delta_z)
-
-        if denom <= 1e-6: return -1.0  # 无解
-
-        v0_sq = (self.g * (Delta_x ** 2)) / denom
-        if v0_sq < 0: return -1.0
-
-        return np.sqrt(v0_sq)
-
-    def _compute_dynamics(self, action, torque_only=False):
-        x, y, theta, l = self.q
-
-        # --- Action 处理 ---
-        F1, F2 = 0.0, 0.0
-
-        if torque_only:
-            # APEX 阶段：仅输出微小差动推力产生力矩，不产生主要升力
-            torque_mag = 0.1 * self.thrust
-            # action[0]=1 -> F1增加 (逆时针力矩), action[1]=1 -> F2增加 (顺时针力矩)
-            # 简化模型：F1产生正升力+力矩，F2产生正升力-力矩。
-            # 为了纯力矩，我们假设 F1=T, F2=-T (物理上不可行因为桨不能反转)，
-            # 或者 F1=T, F2=0, 忽略微小升力。这里采用后者。
-            if action[0] > 0.5: F1 += torque_mag
-            if action[1] > 0.5: F2 += torque_mag
-        else:
-            # 正常推力模式
-            F1 = self.thrust * float(action[0])
-            F2 = self.thrust * float(action[1])
-
-        c, s = math.cos(theta), math.sin(theta)
-
-        # --- 动力学矩阵 ---
-        M = np.array([
-            [self.m1 + self.m2, 0.0, l * self.m1 * c, self.m1 * s],
-            [0.0, self.m1 + self.m2, -l * self.m1 * s, self.m1 * c],
-            [l * self.m1 * c, -l * self.m1 * s, self.Jm + (l ** 2) * self.m1, 0],
-            [self.m1 * s, self.m1 * c, 0, self.m1]
+        self.q = np.array([
+            0.0,  # x: 从 0 开始
+            init_y,  # y: 修改后的高度
+            init_theta,  # theta: 修改后的前倾角度
+            self.l0  # l: 腿长 1.0
         ], dtype=np.float64)
 
-        B = np.array([
-            - self.m1 * (self.dq[2] ** 2) * l * s,
-            - self.m1 * (self.dq[2] ** 2) * l * c,
-            - 2.0 * self.m1 * l * self.dq[2] * (self.dq[1] * c + self.dq[0] * s),
-            (self.dq[2] ** 2) * l * self.m1 + 2 * self.dq[2] * self.dq[0] * self.m1 * c - 2 * self.dq[2] * self.dq[
-                1] * self.m1 * s
+        # 4. 初始化速度
+        # 可以稍微给一点向下的初速度，模拟"扔下来"的感觉，或者设为0
+        self.dq = np.array([
+            np.random.uniform(0.0, 5.0),  # dx: 稍微给一点点向前的初速度
+            np.random.uniform(0.0, 5.0),  # dy: 稍微给一点向下的初速度(砸向地面)
+            0.0,  # dtheta
+            0.0  # dl
         ], dtype=np.float64)
 
-        G = np.array([
-            0.0,
-            (self.m1 + self.m2) * self.g,
-            -self.g * l * self.m1 * s,
-            self.m1 * self.g * c
-        ], dtype=np.float64)
+        self.current_target_idx = 0
+        self.steps = 0
 
-        F_vec = np.array([
-            (F1 + F2) * s,
-            (F1 + F2) * c,
-            (F1 - F2) * self.lc,
-            0
-        ], dtype=np.float64)
+        return self._get_obs(), {}
 
-        # 求解加速度 ddq = M_inv * (F - B - G)
-        try:
-            ddq = np.linalg.solve(M, F_vec - B - G)
-        except np.linalg.LinAlgError:
-            ddq = np.zeros_like(self.dq)
+    def _get_obs(self):
+        rel_x_to_next = self.targets[self.current_target_idx] - self.q[0]
+        return np.concatenate([
+            self.q, self.dq,
+            [rel_x_to_next, float(self.current_target_idx)]
+        ]).astype(np.float32)
 
-        if np.any(np.isnan(ddq)): ddq = np.zeros_like(ddq)
-        return ddq
+    def get_foot_pos(self):
+        x, y, theta = self.q[0], self.q[1], self.q[2]
+        x_f = x + self.l0 * math.sin(theta)
+        y_f = y - self.l0 * math.cos(theta)
+        return np.array([x_f, y_f])
 
     def step(self, action):
+        u1 = np.clip(action[0], 0.0, 1.0)
+        u2 = np.clip(action[1], 0.0, 1.0)
+        F1 = u1 * self.max_thrust
+        F2 = u2 * self.max_thrust
+        F_total = F1 + F2
+        tau = (F2 - F1) * self.lc
+
+        theta = self.q[2]
+        s, c = math.sin(theta), math.cos(theta)
+
+        ddx = (-F_total * s) / self.m
+        ddy = (F_total * c) / self.m - self.g
+        ddtheta = tau / self.J
+
+        self.dq[0] += ddx * self.dt
+        self.dq[1] += ddy * self.dt
+        self.dq[2] += ddtheta * self.dt
+        self.q[0] += self.dq[0] * self.dt
+        self.q[1] += self.dq[1] * self.dt
+        self.q[2] += self.dq[2] * self.dt
+
+        foot_pos = self.get_foot_pos()
+        foot_y = foot_pos[1]
+        foot_x = foot_pos[0]
+
         reward = 0.0
-        done = False
-        info = {}
+        terminated = False
+        truncated = False
 
-        # 计算相对于当前起点的相对位置
-        rel_x = self.q[0] - self.current_origin_x
-        rel_y = self.q[1]
-        rel_pos_sq = rel_x ** 2 + rel_y ** 2
-        current_v = np.sqrt(self.dq[0] ** 2 + self.dq[1] ** 2)
+        # ==========================================
+        # 奖励函数修改 (核心修改区域)
+        # ==========================================
 
-        # ----------------------------------------------------------------------
-        # 状态机逻辑 (State Machine)
-        # ----------------------------------------------------------------------
+        # 1. 存活奖励 (保持不变)
+        reward += 0.01
 
-        # 1. PRE_LAUNCH (寻找发射窗口)
-        if self.flight_state == "PRE_LAUNCH":
-            # A. 几何约束检查
-            in_sector = (self.r_sq < rel_pos_sq < self.R_sq) and \
-                        (self.launch_theta_min < self.q[2] < self.launch_theta_max)
+        # 2. 距离惩罚/奖励 (改用更平滑的引导)
+        # 之前是 +0.2 * dx，这会鼓励它无脑冲。改为鼓励"靠近目标"
+        dist_to_target = abs(foot_x - self.targets[self.current_target_idx])
+        reward += (1.0 / (dist_to_target + 0.1)) * 0.1
 
-            # B. 速度匹配检查
-            req_v = self._calculate_ballistic_velocity(self.q[0], self.q[1], self.q[2])
-            velocity_match = False
-            if req_v > 0 and abs(current_v - req_v) < 0.2:  # 允许 0.2 m/s 的误差
-                velocity_match = True
+        # 3. [新增] 高度惩罚 (Ceiling Penalty)
+        # 强迫它不要飞太高。理想跳跃高度约为 1.5m - 2.0m (机身高度)
+        # 如果超过 2.5m，给予巨大惩罚
+        if self.q[1] > 2.5:
+            reward -= 1.0  # 每一步都扣，很疼
 
-            # 奖励: 引导进入 Sector 并匹配速度
-            if not in_sector:
-                reward -= 0.05  # 没进区域，轻微惩罚
-            else:
-                reward += 0.2  # 进区域奖励
-                if req_v > 0:
-                    v_err = abs(current_v - req_v)
-                    reward += 3.0 * np.exp(-5.0 * v_err)  # 速度匹配奖励
+        # 4. [修改] 能耗惩罚 (Energy Penalty)
+        # 大幅增加油门成本，迫使它利用被动弹跳而不是主动飞行
+        # 之前是 0.001，现在改为 0.05 (增加50倍)
+        reward -= 0.5 * np.sum(action ** 2)
 
-            # 触发发射
-            if in_sector and velocity_match:
-                self.flight_state = "BALLISTIC"
-                reward += 20.0  # 巨大的发射奖励
-                # print(f"🚀 Launch! TargetIdx={self.current_target_idx}")
+        # 5. [新增] 姿态惩罚 (Stability)
+        # 稍微加强对倾斜的惩罚，防止乱翻
+        reward -= 2.0 * abs(self.q[2])
 
-        # 2. BALLISTIC (滑翔阶段 - 推力锁死)
-        if self.flight_state == "BALLISTIC":
-            action = [0, 0]  # 强制关闭推力
-            reward -= 0.01
+        # ==========================================
+        # 触地逻辑 (Raibert Pogo Physics)
+        # ==========================================
+        if foot_y <= self.ground_y and self.dq[1] < 0:  # 触地
 
-            # 检测 Apex (最高点)
-            if abs(self.dq[1]) < 0.3 and self.q[1] > 0.5:
-                self.flight_state = "APEX_ADJUST"
+            # 只有触地时，能获得"反弹奖励"
+            # 这鼓励 AI 主动去触地，因为这是获得动量最"便宜"的方式(Raibert模型免费给速度)
+            reward += 5.0
 
-        # 3. APEX_ADJUST (最高点姿态修正 - 仅力矩)
-        is_torque_mode = False
-        if self.flight_state == "APEX_ADJUST":
-            is_torque_mode = True
-            # 目标：调整 theta 指向 landing_pitch_target (-20 deg)
-            ang_err = abs(self.q[2] - self.landing_pitch_target)
-            reward += 1.0 * np.exp(-10.0 * ang_err)
-
-            # 如果开始显著下落，转入 Descending
-            if self.dq[1] < -0.5:
-                self.flight_state = "DESCENDING"
-
-        # 4. DESCENDING (下落 - 推力锁死)
-        if self.flight_state == "DESCENDING":
-            action = [0, 0]
-            is_torque_mode = False
-
-        # ----------------------------------------------------------------------
-        # 物理积分
-        # ----------------------------------------------------------------------
-        ddq = self._compute_dynamics(action, torque_only=is_torque_mode)
-        self.dq += ddq * self.dt
-        self.q += self.dq * self.dt
-
-        # 角度归一化 (-pi, pi)
-        self.q[2] = (self.q[2] + math.pi) % (2 * math.pi) - math.pi
-        self.steps += 1
-
-        # ----------------------------------------------------------------------
-        # 落地检测与多跳重置
-        # ----------------------------------------------------------------------
-        if self.q[1] <= 0:
-            if self.current_target_idx < len(self.global_targets):
-                target_x = self.global_targets[self.current_target_idx]
-                dist_err = abs(self.q[0] - target_x)
-                pitch_err = abs(self.q[2] - self.landing_pitch_target)
-
-                # 落地判定：位置准 & 姿态准
-                if dist_err < 0.4 and pitch_err < math.radians(20):
-                    # --- 成功落地 (Landing Success) ---
-                    reward += 50.0
-
-                    # 切换到下一个目标
+            if dist_to_target < self.target_tolerance:
+                reward += 100.0  # 到达奖励
+                print(f"🎯 踩中目标! Dist: {dist_to_target:.3f}")
+                if self.current_target_idx == 1:
+                    terminated = True
+                    reward += 500.0  # 最终大奖
+                else:
                     self.current_target_idx += 1
 
-                    if self.current_target_idx >= len(self.global_targets):
-                        # 任务全部完成
-                        done = True
-                        reward += 100.0
-                    else:
-                        # --- 模拟 Stance Phase (原地重置) ---
-                        # 将当前落点设为新的 "原点"
-                        self.current_origin_x = self.q[0]
-                        # 动能归零 (模拟触地吸能)
-                        self.dq[:] = 0.0
-                        self.q[1] = 0.0
-                        # 状态重置为寻找下一次发射
-                        self.flight_state = "PRE_LAUNCH"
-                else:
-                    # --- 失败 (Crash) ---
-                    done = True
-                    reward -= 50.0  # 坠毁惩罚
-            else:
-                done = True
+            # Raibert 物理 (瞬间反弹)
+            # 这是一个"魔法"物理，不消耗电能就能获得向上的速度
+            # AI 会发现：用电机飞很贵(扣分)，撞地反弹免费(给分且给速度)，所以它会选择跳。
+            h_target = 1.5  # 目标弹跳高度
+            v_launch = math.sqrt(2 * self.g * h_target)
+            self.dq[1] = v_launch
 
-        # 超时
-        if self.steps >= self.max_steps:
-            done = True
+            # 触地时修正水平速度和角速度 (模拟摩擦和控制)
+            self.dq[0] -= 2.0 * theta
+            self.dq[2] -= 5.0 * theta
 
-        # 翻滚保护
-        if abs(self.q[2]) > math.radians(100):
-            done = True
-            reward -= 10.0
+            # 防止穿模
+            self.q[1] = self.ground_y + self.l0 * math.cos(theta) + 0.01
 
-        info['state_phase'] = self.flight_state
-        return self._obs(), reward, done, info
+        # ==========================================
+        # 终止条件 (Termination)
+        # ==========================================
+        # 1. 摔倒 (高度太低 或 角度太大)
+        # 注意：因为腿长1.0m，机身高度 < 0.5 肯定已经摔了
+        if self.q[1] < 0.5 or abs(self.q[2]) > math.radians(60):
+            terminated = True
+            reward -= 50.0  # 摔倒惩罚
 
-    def beam_endpoints(self):
-        # 用于绘图辅助
-        cx, cy, theta = self.q[0], self.q[1], self.q[2]
-        dx = math.cos(theta) * self.lc
-        dy = math.sin(theta) * self.lc
-        left = (cx - dx + self.l0 * math.sin(theta), cy + dy + self.l0 * math.cos(theta))
-        right = (cx + dx + self.l0 * math.sin(theta), cy - dy + self.l0 * math.cos(theta))
-        tip = (cx + math.sin(theta) * self.l0, cy + math.cos(theta) * self.l0)
-        return left, right, tip
+        # 2. [新增] 飞出天际 (Fly Away)
+        # 如果飞得太高(比如超过4米)，直接判负并结束
+        if self.q[1] > 4.0:
+            terminated = True
+            reward -= 100.0
+            print("❌ 飞太高了，判定为失控")
+
+        self.steps += 1
+        if self.steps >= self.max_episode_steps:
+            truncated = True
+
+        info = {"current_target": self.current_target_idx}
+        return self._get_obs(), reward, terminated, truncated, info
+
+    def render(self):
+        pass
+
+    def close(self):
+        pass
 
 
-# ==============================================================================
-# 2. PPO 算法 (Training & Inference)
-# ==============================================================================
+if __name__ == '__main__':
+    freeze_support()
 
-class ActorCritic(nn.Module):
-    def __init__(self, obs_dim=6, hidden=256):  # Obs dim 增加到 6
-        super().__init__()
-        self.actor = nn.Sequential(
-            nn.Linear(obs_dim, hidden), nn.Tanh(),
-            nn.Linear(hidden, hidden), nn.Tanh(),
-            nn.Linear(hidden, 2)  # Output logits for Bernoulli
+    MODEL_PATH = "ppo_quadhopper_targets"  # 不带 .zip 后缀
+    TOTAL_TIMESTEPS = 5_000_000
+
+    # ==================== 选择模式 ====================
+    mode = "test"  # "train_new" / "continue" / "test"
+
+    if mode == "train_new":
+        # 从零开始全新训练
+        print("🚀 从零开始全新训练...")
+        vec_env = make_vec_env(QuadhopperTargetEnv, n_envs=12, vec_env_cls=SubprocVecEnv)
+
+        model = PPO(
+            "MlpPolicy", vec_env, verbose=1,
+            policy_kwargs=dict(activation_fn=th.nn.ReLU, net_arch=dict(pi=[256, 256], vf=[256, 256])),
+            learning_rate=3e-4, n_steps=2048, batch_size=128, n_epochs=10,
+            gamma=0.99, gae_lambda=0.95, clip_range=0.2,
+            tensorboard_log="./quadhopper_ppo_tensorboard/"
         )
-        self.critic = nn.Sequential(
-            nn.Linear(obs_dim, hidden), nn.Tanh(),
-            nn.Linear(hidden, hidden), nn.Tanh(),
-            nn.Linear(hidden, 1)
-        )
-        self._init_weights()
 
-    def _init_weights(self):
-        for m in self.modules():
-            if isinstance(m, nn.Linear):
-                nn.init.xavier_uniform_(m.weight)
-                nn.init.constant_(m.bias, 0.0)
+        # 可选评估回调
+        callback_on_best = StopTrainingOnRewardThreshold(reward_threshold=320, verbose=1)
+        eval_env = DummyVecEnv([lambda: QuadhopperTargetEnv()])
+        eval_callback = EvalCallback(eval_env, best_model_save_path="./logs/best_model/",
+                                     log_path="./logs/", eval_freq=10000,
+                                     deterministic=True, render=False,
+                                     callback_on_new_best=callback_on_best)
 
-    def forward(self, x):
-        logits = self.actor(x)
-        value = self.critic(x).squeeze(-1)
-        return logits, value
+        model.learn(total_timesteps=TOTAL_TIMESTEPS, callback=eval_callback)
+        model.save(MODEL_PATH)
+        print(f"✅ 新训练完成，模型已保存到 {MODEL_PATH}.zip")
 
+    elif mode == "continue":
+        # 加载已有模型继续训练
+        if not os.path.exists(MODEL_PATH + ".zip"):
+            raise FileNotFoundError(f"找不到模型文件 {MODEL_PATH}.zip，请先训练或检查路径")
 
-def compute_gae(rewards, values, dones, gamma=0.99, lam=0.95):
-    T = len(rewards)
-    advs = np.zeros(T, dtype=np.float32)
-    lastgaelam = 0.0
-    for t in reversed(range(T)):
-        next_val = 0.0 if t == T - 1 else values[t + 1]
-        next_non_terminal = 0.0 if dones[t] else 1.0
+        print("🔄 加载已有模型，继续训练...")
+        vec_env = make_vec_env(QuadhopperTargetEnv, n_envs=12, vec_env_cls=SubprocVecEnv)
+        model = PPO.load(MODEL_PATH, env=vec_env)
 
-        delta = rewards[t] + gamma * next_val * next_non_terminal - values[t]
-        lastgaelam = delta + gamma * lam * next_non_terminal * lastgaelam
-        advs[t] = lastgaelam
-    returns = advs + values
-    return returns, (advs - advs.mean()) / (advs.std() + 1e-8)
+        model.learn(total_timesteps=TOTAL_TIMESTEPS, reset_num_timesteps=False)  # 重要：不重置步数计数
+        model.save(MODEL_PATH)
+        print(f"✅ 继续训练完成，模型已更新保存到 {MODEL_PATH}.zip")
 
+    elif mode == "test":
+        # 只加载模型测试 + 录制动画
+        if not os.path.exists(MODEL_PATH + ".zip"):
+            raise FileNotFoundError(f"找不到模型文件 {MODEL_PATH}.zip，请先训练")
 
-def train_ppo(env, device, model_path="ppo_multihop.pt", num_updates=2000):
-    net = ActorCritic(obs_dim=6).to(device)
-    opt = optim.Adam(net.parameters(), lr=3e-4)
+        print("🎬 加载模型进行测试和录制动画...")
+        import matplotlib.pyplot as plt
+        import imageio
 
-    print(f"Starting PPO Training on {device}...")
-    batch_size = 2048
+        eval_env = DummyVecEnv([lambda: QuadhopperTargetEnv()])
+        model = PPO.load(MODEL_PATH)
 
-    for update in range(num_updates):
-        obs_buf, act_buf, logp_buf, rew_buf, val_buf, done_buf = [], [], [], [], [], []
+        obs = eval_env.reset()
+        images = []
+        print("正在录制动画（最多1000步）...")
+        import matplotlib.pyplot as plt
+        import matplotlib
+        import imageio
+        import numpy as np
 
-        # --- Collection Phase ---
-        steps = 0
-        while steps < batch_size:
-            obs = env.reset()
-            done = False
-            while not done:
-                o_tensor = torch.tensor(obs, dtype=torch.float32, device=device).unsqueeze(0)
-                with torch.no_grad():
-                    logits, val = net(o_tensor)
+        # 强制使用非交互后端，避免 macosx 后端问题
+        matplotlib.use('Agg')  # 关键！无窗口、无交互、纯离屏渲染
 
-                dist = torch.distributions.Bernoulli(logits=logits)
-                action = dist.sample()
-                logp = dist.log_prob(action).sum().item()
-                action_np = action.cpu().numpy()[0]
+        WIDTH, HEIGHT = 1000, 500  # 我们想要的固定像素尺寸
 
-                next_obs, r, done, _ = env.step(action_np)
+        for i in range(1000):
+            action, _ = model.predict(obs, deterministic=True)
+            obs, reward, done, info = eval_env.step(action)
 
-                obs_buf.append(obs)
-                act_buf.append(action_np)
-                logp_buf.append(logp)
-                rew_buf.append(r)
-                val_buf.append(val.item())
-                done_buf.append(done)
+            # ... (前文代码不变)
 
-                obs = next_obs
-                steps += 1
-                if done or steps >= batch_size:
-                    break
+            # 创建固定大小的图
+            fig = plt.figure(figsize=(WIDTH / 100, HEIGHT / 100), dpi=100)
+            ax = fig.add_subplot(111)
 
-        # --- Update Phase ---
-        obs_t = torch.tensor(np.array(obs_buf), dtype=torch.float32, device=device)
-        act_t = torch.tensor(np.array(act_buf), dtype=torch.float32, device=device)
-        logp_t = torch.tensor(np.array(logp_buf), dtype=torch.float32, device=device)
+            # 调整视野范围 (因为腿长变成了1.0，跳得更高了，视野要放大)
+            ax.set_xlim(obs[0][0] - 3, obs[0][0] + 7)  # 视野放宽
+            ax.set_ylim(-1.5, 3.5)  # 高度放宽 (腿长1m + 跳跃高度)
+            ax.set_aspect('equal')
+            ax.grid(True, alpha=0.3)
 
-        returns, advs = compute_gae(rew_buf, val_buf, done_buf)
-        ret_t = torch.tensor(returns, dtype=torch.float32, device=device)
-        adv_t = torch.tensor(advs, dtype=torch.float32, device=device)
+            x, y, theta = obs[0][0], obs[0][1], obs[0][2]
 
-        # Mini-batch update
-        idxs = np.arange(len(obs_buf))
-        for _ in range(4):  # epochs
-            np.random.shuffle(idxs)
-            for start in range(0, len(idxs), 512):
-                mb = idxs[start:start + 512]
+            # === 使用新的物理尺寸进行绘制 ===
+            # 获取环境中的真实尺寸 (如果无法直接获取，手动填入 0.177 和 1.0)
+            draw_lc = 0.177  # 对应 self.lc
+            draw_l0 = 1.0  # 对应 self.l0
 
-                logits, val = net(obs_t[mb])
-                dist = torch.distributions.Bernoulli(logits=logits)
-                new_logp = dist.log_prob(act_t[mb]).sum(dim=-1)
+            # 绘制机臂 (Body)
+            xl = x - draw_lc * math.cos(theta)
+            yl = y - draw_lc * math.sin(theta)
+            xr = x + draw_lc * math.cos(theta)
+            yr = y + draw_lc * math.sin(theta)
 
-                ratio = torch.exp(new_logp - logp_t[mb])
-                surr1 = ratio * adv_t[mb]
-                surr2 = torch.clamp(ratio, 0.8, 1.2) * adv_t[mb]
+            # 绘制腿 (Leg)
+            # 注意: 这里使用你在 get_foot_pos 中的逻辑
+            foot_x = x + draw_l0 * math.sin(theta)
+            foot_y = y - draw_l0 * math.cos(theta)
 
-                policy_loss = -torch.min(surr1, surr2).mean()
-                value_loss = ((ret_t[mb] - val.squeeze(-1)) ** 2).mean()
-                entropy = dist.entropy().mean()
+            ax.plot([-10, 20], [0, 0], 'k-', lw=2)  # 地面
+            ax.plot([xl, xr], [yl, yr], 'k-', lw=4)  # 机身 (加粗)
+            ax.plot([x, foot_x], [y, foot_y], 'b-', lw=2)  # 腿
+            ax.plot([foot_x], [foot_y], 'ro', markersize=8)  # 脚 (圆球加大)
+            ax.plot([xl], [yl], 'go', markersize=6)  # 左电机
+            ax.plot([xr], [yr], 'go', markersize=6)  # 右电机
 
-                loss = policy_loss + 0.5 * value_loss - 0.01 * entropy
+            current_target_x = 4.0 if info[0]['current_target'] == 1 else 2.0
+            ax.set_title(f"Step {i} | Vel X: {obs[0][4]:.2f} m/s | Next Target: {current_target_x:.1f} m")
 
-                opt.zero_grad()
-                loss.backward()
-                opt.step()
+            # 渲染到固定大小的 buffer
+            fig.canvas.draw()
+            image = np.frombuffer(fig.canvas.tostring_rgb(), dtype='uint8')
+            image = image.reshape((HEIGHT, WIDTH, 3))  # 直接强制 reshape 到我们想要的尺寸
 
-        avg_rew = np.sum(rew_buf) / (np.sum(done_buf) + 1e-8)
-        if update % 10 == 0:
-            print(f"Update {update}: Avg Reward per Ep = {avg_rew:.2f}")
-            torch.save(net.state_dict(), model_path)
+            images.append(image)
+            plt.close(fig)
 
-    return net
+            if done[0]:
+                print("Episode 结束")
+                break
 
-
-# ==============================================================================
-# 3. 可视化 (Visualization with Dynamic Wedge)
-# ==============================================================================
-
-def rollout_and_render_multihop(env, policy_net, device, max_steps=800, save_gif=True, filename='multihop_mission.gif'):
-    frames = []
-    obs = env.reset()
-    done = False
-    steps = 0
-
-    print("Simulating rollout for visualization...")
-
-    while not done and steps < max_steps:
-        # PPO Action
-        o_tensor = torch.tensor(obs, dtype=torch.float32, device=device).unsqueeze(0)
-        with torch.no_grad():
-            logits, _ = policy_net(o_tensor)
-        # 确定性选择 (Deterministic for vis)
-        action = (torch.sigmoid(logits) > 0.5).cpu().numpy()[0].astype(int)
-
-        next_obs, _, done, info = env.step(action)
-
-        # 记录数据
-        left, right, tip = env.beam_endpoints()
-        frames.append({
-            'q': env.q.copy(),
-            'left': left, 'right': right, 'tip': tip,
-            'origin_x': env.current_origin_x,
-            'flight_state': env.flight_state,
-            'target_idx': env.current_target_idx,
-            'step': steps
-        })
-
-        obs = next_obs
-        steps += 1
-
-    # --- Matplotlib Animation ---
-    print(f"Generating animation ({len(frames)} frames)...")
-    fig, ax = plt.subplots(figsize=(12, 6))
-    ax.set_aspect('equal')
-    ax.grid(True, alpha=0.3)
-
-    max_x = env.global_targets[-1] + 2.0
-    ax.set_xlim(-1.0, max_x)
-    ax.set_ylim(-1.0, 3.5)
-
-    # Ground & Targets
-    ax.plot([-2, max_x + 2], [0, 0], 'k-', lw=2)
-    for i, tx in enumerate(env.global_targets):
-        ax.plot(tx, 0, 'rx', ms=10, markeredgewidth=2)
-        ax.text(tx, -0.3, f"T{i + 1}", ha='center')
-
-    # Actors
-    leg_line, = ax.plot([], [], 'k-', lw=2)
-    beam_line, = ax.plot([], [], 'k-', lw=2)
-    body_dot, = ax.plot([], [], 'bo', zorder=5)
-    traj_line, = ax.plot([], [], 'g--', alpha=0.5, lw=1)
-
-    # --- Dynamic Wedge (Launch Sector) ---
-    # Convert physics angles (CW from Y) to Matplotlib (CCW from X)
-    vis_theta1 = 90 - env.launch_theta_max_deg
-    vis_theta2 = 90 - env.launch_theta_min_deg
-
-    sector_patch = patches.Wedge(
-        (0, 0), env.R_outer, vis_theta1, vis_theta2,
-        width=env.R_outer - env.r_inner,
-        color='orange', alpha=0.2, label='Launch Zone'
-    )
-    ax.add_patch(sector_patch)
-
-    info_text = ax.text(0.02, 0.9, "", transform=ax.transAxes,
-                        bbox=dict(boxstyle="round", facecolor="white", alpha=0.9))
-
-    def init():
-        return leg_line, beam_line, body_dot, traj_line, sector_patch, info_text
-
-    def update(i):
-        if i >= len(frames): return init()
-        f = frames[i]
-
-        # Geometry
-        bx, by = f['q'][0], f['q'][1]
-        lx, ly = f['left']
-        rx, ry = f['right']
-        tx, ty = f['tip']
-
-        leg_line.set_data([bx, tx], [by, ty])
-        beam_line.set_data([lx, rx], [ly, ry])
-        body_dot.set_data([bx], [by])
-
-        # Trajectory
-        start = max(0, i - 100)
-        xs = [fr['q'][0] for fr in frames[start:i]]
-        ys = [fr['q'][1] for fr in frames[start:i]]
-        traj_line.set_data(xs, ys)
-
-        # Wedge Update
-        sector_patch.set_center((f['origin_x'], 0))
-
-        # Color Coding
-        if f['flight_state'] == "PRE_LAUNCH":
-            sector_patch.set_facecolor('orange')
-            sector_patch.set_alpha(0.3)
-        elif f['flight_state'] == "BALLISTIC":
-            sector_patch.set_facecolor('green')
-            sector_patch.set_alpha(0.2)
-        else:
-            sector_patch.set_facecolor('gray')
-            sector_patch.set_alpha(0.05)
-
-        info_text.set_text(f"Step: {f['step']}\nState: {f['flight_state']}\nTarget: {f['target_idx']}")
-        return leg_line, beam_line, body_dot, traj_line, sector_patch, info_text
-
-    ani = FuncAnimation(fig, update, frames=len(frames), init_func=init, interval=30, blit=True)
-
-    if save_gif:
-        ani.save(filename, writer=PillowWriter(fps=30))
-        print(f"Saved {filename}")
-
-    plt.show()
-
-
-# ==============================================================================
-# 4. Main Execution
-# ==============================================================================
-
-if __name__ == "__main__":
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model_path = "ppo_multihop_v2.pt"
-
-    # 定义环境 (2跳任务示例)
-    env = QuadHopperMultiJumpEnv(
-        targets=[2.5, 5.0],
-        r_inner=0.5, R_outer=1.8,
-        launch_theta_min_deg=30, launch_theta_max_deg=60
-    )
-
-    policy_net = ActorCritic(obs_dim=6).to(device)
-
-    # 模式选择
-    if os.path.exists(model_path):
-        print(f"Loading existing model: {model_path}")
-        policy_net.load_state_dict(torch.load(model_path, map_location=device))
-
-        # 可选：继续训练一小会儿
-        # train_ppo(env, device, model_path, num_updates=200)
-    else:
-        print("No model found, starting fresh training...")
-        train_ppo(env, device, model_path, num_updates=1000)
-
-    # 运行可视化
-    policy_net.eval()
-    rollout_and_render_multihop(env, policy_net, device, max_steps=600, save_gif=True)
+        imageio.mimsave('quadhopper_trained_demo.gif', images, fps=50)
+        print("✅ 动画已成功保存为 'quadhopper_trained_demo.gif‘")
