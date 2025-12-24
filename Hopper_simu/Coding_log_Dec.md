@@ -62,6 +62,8 @@ Then, we add a altitude condition tu let it change altitude automatically. I tri
 
 ![alt text](<results /jumping_robot_simulation_ground_1.gif>)
 
-Then I was thinking whether i can first make a continues jumping based on the raibert control. Also I 
+Then I was thinking whether i can first make a continues jumping based on the raibert control. Also I use Stble baseline3 (SB3) to train the model. Here 's the result from 
+`Quadhopper12_23`.
+
 ![alt text](<results /quadhopper_raibert_trained_demo.gif>)
  

@@ -1,625 +1,367 @@
 import math
 import numpy as np
-import matplotlib.pyplot as plt
-from matplotlib.animation import FuncAnimation, PillowWriter
-import torch
-import torch.nn as nn
-import torch.optim as optim
+import gymnasium as gym
+from gymnasium import spaces
+from stable_baselines3 import PPO
+from stable_baselines3.common.vec_env import DummyVecEnv, SubprocVecEnv
+from stable_baselines3.common.env_util import make_vec_env
+from stable_baselines3.common.callbacks import EvalCallback, StopTrainingOnRewardThreshold
+from stable_baselines3.common.env_checker import check_env
+import torch as th
+from multiprocessing import freeze_support  # Windows 需要这个，但 macOS 无害
 import os
-import matplotlib.patches as patches
 
+class QuadhopperTargetEnv(gym.Env):
+    metadata = {"render_modes": ["human", "rgb_array"], "render_fps": 30}
+    def __init__(self, render_mode=None):
+        super().__init__()
+        self.render_mode = render_mode
 
-# Environment (flight phase, l fixed)
-class TJumpEnvFlight2DOF:
-    def __init__(self,
-                 dt=0.005,
-                 m1=0.0363, m2=0.01, Jm=0.02, lc=0.25, l0=0.50, g=9.81, thrust=0.314,
-                 max_steps=350,
-                 target_x=2.0, target_z=0.0,  # Rename target_theta to generic, added target_z
-                 # --- New Constraints Parameters ---
-                 r_radius=0.5, R_radius=1.5):  # r < distance < R
+        # ==========================================
+        # 1. 物理参数 (基于 cf2.xml 更新)
+        # ==========================================
+        self.dt = 0.005
 
-        self.dt = float(dt)
-        self.m1 = float(m1)
-        self.m2 = float(m2)
-        self.Jm = float(Jm)
-        self.lc = float(lc)
-        self.l0 = float(l0)
-        self.g = float(g)
-        self.thrust = float(thrust)
-        self.max_steps = int(max_steps)
-        self.target_x = float(target_x)
-        self.target_z = float(target_z)
+        # 质量: Body(1.1) + Foot(0.11)
+        self.m = 1.21
 
-        # New: Target landing angle (flat)
-        self.target_phi = 0.0
+        # 腿长: 基于 pos="0 0 -1.0"
+        self.l0 = 1.0
 
-        # Ballistic Launch Zone Parameters
-        self.r_sq = r_radius ** 2
-        self.R_sq = R_radius ** 2
+        # 力臂 (半宽): 基于 motor_site pos="0.1768"
+        self.lc = 0.177
 
-        self.reset()
+        # 转动惯量: 基于 diaginertia="0.15 ..."
+        self.J = 0.15
 
-    def reset(self, x=0, y=0, theta=None, l=1.0, dx=None, dy=None, dtheta=0, dl=0):
-        # Initial state randomization
-        if dx is None: dx = float(np.random.uniform(2, 4.5))
-        if dy is None: dy = float(np.random.uniform(2, 4.5))
-        if theta is None: theta = float(np.random.uniform(-math.pi / 10, math.pi / 10))
+        self.g = 9.81
 
-        # Start near origin
-        x = float(np.random.uniform(-0.1, 0.1))
-        y = float(np.random.uniform(0.1, 0.2))
+        # 推力: 单电机15N * 2 (双桨合并) = 30N
+        self.max_thrust = 30.0
 
-        self.q = np.array([x, y, theta, l], dtype=np.float32)
-        self.dq = np.array([dx, dy, dtheta, dl], dtype=np.float32)
+        # 弹簧参数 (虽然当前step用的是Raibert跳跃, 但建议存着)
+        self.k_spring = 150.0
+        self.c_damping = 1.0
+
+        self.ground_y = 0.0
+
+        # ==========================================
+        # 2. 目标与空间设置 (保持逻辑不变)
+        # ==========================================
+        # 两个固定目标 (因为腿变长了1.0m, 步幅变大，建议稍微拉远目标距离)
+        self.targets = np.array([2.0, 4.0])
+        self.target_tolerance = 0.20  # 适当放宽判定范围
+
+        # Action: 左右油门 [0,1]
+        self.action_space = spaces.Box(low=0.0, high=1.0, shape=(2,), dtype=np.float32)
+
+        # Observation
+        self.observation_space = spaces.Box(low=-np.inf, high=np.inf, shape=(10,), dtype=np.float32)
+
+        self.current_target_idx = 0
         self.steps = 0
-        self.prev_action = np.array([0, 0], dtype=np.int32)
+        self.max_episode_steps = 2000
 
-        # --- Phase State Machine ---
-        # Phase 1: Active Thrust (Inside R), Phase 2: Passive Coast (Outside R)
-        self.phase = 1
+    def reset(self, seed=None, options=None):
+        super().reset(seed=seed)
 
-        return self._obs()
+        if seed is not None:
+            np.random.seed(seed)
 
-    def _obs(self):
-        # 计算相对目标的距离
-        rel_x = self.target_x - self.q[0]
-        rel_z = self.target_z - self.q[1]
+        # 1. 随机初始化角度 (Theta)
+        init_theta = np.random.uniform(math.radians(-60), math.radians(-30))
 
-        # 归一化 Phase 信息 (0.0 或 1.0)
-        phase_obs = 1.0 if self.phase == 1 else 0.0
+        # 2. 计算最小安全高度 (Min Safe Height)
+        # 腿完全伸直时的垂直长度 = l0 * cos(theta)
+        leg_vertical_height = self.l0 * math.cos(init_theta)
 
-        # 将 R 边界也告诉网络（以此判断还有多久进入 Phase 2）
-        dist_to_R = np.sqrt(self.R_sq) - np.sqrt(self.q[0] ** 2 + self.q[1] ** 2)
+        # 3. 随机初始化高度 (Y)
+        # 我们需要在腿长基础上，再加一点"悬空高度"，让它落下来积蓄能量
+        init_y = np.random.uniform(1.2, 1.5)
 
-        # 扩充观测向量: [x, y, dx, dy, dtheta, theta, rel_x, rel_z, phase, dist_to_R]
-        # 共 10 维
-        obs = np.array([
-            self.q[0], self.q[1],
-            self.dq[0], self.dq[1],
-            self.dq[2], self.q[2],
-            rel_x, rel_z,
-            phase_obs, dist_to_R
-        ], dtype=np.float32)
-        return obs
+        # 确保无论如何 y 都要比腿长高 (防止插地)
+        init_y = max(init_y, leg_vertical_height + 0.1)
 
-    def beam_endpoints(self):
-        cx, cy, theta = float(self.q[0]), float(self.q[1]), float(self.q[2])
-        dx = math.cos(theta) * self.lc
-        dy = math.sin(theta) * self.lc
-        left = (cx - dx + self.l0 * math.sin(theta), cy + dy + self.l0 * math.cos(theta))
-        right = (cx + dx + self.l0 * math.sin(theta), cy - dy + self.l0 * math.cos(theta))
-        return left, right
-
-    def _compute_M_B_G_F(self, action):
-        x, y, theta, l = [float(v) for v in self.q]
-        a = np.array(action, dtype=np.int32)
-
-        # --- Phase Logic for Actuation ---
-        # Phase 1: Normal Thrust + Torque
-        # Phase 2: Thrust = 0, Torque active (simulating momentum wheel or residual control)
-
-        raw_F1 = self.thrust * float(a[0])
-        raw_F2 = self.thrust * float(a[1])
-
-        if self.phase == 1:
-            F_thrust_net = raw_F1 + raw_F2
-            # Torque = (F1 - F2) * lc
-            Torque_net = (raw_F1 - raw_F2) * self.lc
-        else:
-            # Phase 2: Lock Thrust to 0
-            F_thrust_net = 0.0
-            # Keep Torque active based on action difference
-            Torque_net = (raw_F1 - raw_F2) * self.lc
-
-        c, s = math.cos(theta), math.sin(theta)
-
-        # M, B, G matrices calculation (UNCHANGED)
-        M = np.array([
-            [self.m1 + self.m2, 0.0, l * self.m1 * c, self.m1 * s],
-            [0.0, self.m1 + self.m2, -l * self.m1 * s, self.m1 * c],
-            [l * self.m1 * c, -l * self.m1 * s, self.Jm + (l ** 2) * self.m1, 0],
-            [self.m1 * s, self.m1 * c, 0, self.m1]
+        self.q = np.array([
+            0.0,  # x: 从 0 开始
+            init_y,  # y: 修改后的高度
+            init_theta,  # theta: 修改后的前倾角度
+            self.l0  # l: 腿长 1.0
         ], dtype=np.float64)
 
-        B = np.array([
-            - self.m1 * (self.dq[2] ** 2) * l * s,
-            - self.m1 * (self.dq[2] ** 2) * l * c,
-            - 2.0 * self.m1 * l * self.dq[2] * (self.dq[1] * c + self.dq[0] * s),
-            (self.dq[2] ** 2) * l * self.m1 + 2 * self.dq[2] * self.dq[0] * self.m1 * c - 2 * self.dq[2] * self.dq[
-                1] * self.m1 * s
+        # 4. 初始化速度
+        # 可以稍微给一点向下的初速度，模拟"扔下来"的感觉，或者设为0
+        self.dq = np.array([
+            np.random.uniform(0.0, 5.0),  # dx: 稍微给一点点向前的初速度
+            np.random.uniform(0.0, 5.0),  # dy: 稍微给一点向下的初速度(砸向地面)
+            0.0,  # dtheta
+            0.0  # dl
         ], dtype=np.float64)
 
-        G = np.array([
-            0.0,
-            (self.m1 + self.m2) * self.g,
-            - self.g * l * self.m1 * s,
-            self.m1 * self.g * c
-        ], dtype=np.float64)
+        self.current_target_idx = 0
+        self.steps = 0
 
-        # Modified F vector construction to respect Phase constraints
-        F = np.array([
-            F_thrust_net * s,  # Fx component
-            F_thrust_net * c,  # Fy component
-            Torque_net,  # Moment component
-            0
-        ], dtype=np.float64)
+        return self._get_obs(), {}
 
-        # Collision logic (remains the same)
-        if y <= 0:
-            W = np.array([[0, 1, 0, 0]], dtype=np.float64)
-            W_dot = np.zeros_like(W)
-            A = W @ np.linalg.inv(M) @ W.T
-            rhs = W @ np.linalg.inv(M) @ (B + G - F) - W_dot @ self.dq
-            lam = np.linalg.solve(A, rhs)
-            ddq = np.linalg.inv(M) @ (F - B - G + W.T @ lam)
-        else:
-            ddq = np.linalg.solve(M, F - B - G)
+    def _get_obs(self):
+        rel_x_to_next = self.targets[self.current_target_idx] - self.q[0]
+        return np.concatenate([
+            self.q, self.dq,
+            [rel_x_to_next, float(self.current_target_idx)]
+        ]).astype(np.float32)
 
-        if np.any(np.isnan(ddq)) or np.any(np.isinf(ddq)):
-            ddq = np.zeros_like(ddq)
-
-        return ddq, (M, B, G, F)
-
-    def get_ballistic_req(self):
-        """Calculates v_req based on user prompt equations."""
-        x0, y0, theta0 = self.q[0], self.q[1], self.q[2]
-        Delta_x = self.target_x - x0
-        Delta_z = self.target_z - y0
-
-        # Feasibility Check: Delta x * tan(theta) - Delta z > 0
-        cos_sq = math.cos(theta0) ** 2
-        tan_theta = math.tan(theta0)
-
-        denom_term = (Delta_x * tan_theta - Delta_z)
-
-        v_req = 0.0
-        feasible = False
-
-        if denom_term > 0 and cos_sq > 1e-4 and Delta_x > 0.05:
-            # v0 formula from prompt
-            # v0 = sqrt( (g * dx^2) / (2 * cos^2 * (dx * tan - dz)) )
-            val = (self.g * (Delta_x ** 2)) / (2 * cos_sq * denom_term)
-            if val > 0:
-                v_req = math.sqrt(val)
-                feasible = True
-
-        return v_req, feasible
+    def get_foot_pos(self):
+        x, y, theta = self.q[0], self.q[1], self.q[2]
+        x_f = x + self.l0 * math.sin(theta)
+        y_f = y - self.l0 * math.cos(theta)
+        return np.array([x_f, y_f])
 
     def step(self, action):
-        # --- 1. State Machine Update ---
-        dist_sq = self.q[0] ** 2 + self.q[1] ** 2
+        u1 = np.clip(action[0], 0.0, 1.0)
+        u2 = np.clip(action[1], 0.0, 1.0)
+        F1 = u1 * self.max_thrust
+        F2 = u2 * self.max_thrust
+        F_total = F1 + F2
+        tau = (F2 - F1) * self.lc
 
-        if self.phase == 1:
-            if dist_sq >= self.R_sq:
-                self.phase = 2  # Transition to Coast
+        theta = self.q[2]
+        s, c = math.sin(theta), math.cos(theta)
 
-        # --- 2. Guidance Calculation (Before physics update) ---
-        v_req, feasible = self.get_ballistic_req()
-        current_v = np.sqrt(self.dq[0] ** 2 + self.dq[1] ** 2)
+        ddx = (-F_total * s) / self.m
+        ddy = (F_total * c) / self.m - self.g
+        ddtheta = tau / self.J
 
-        # --- 3. Dynamics Integration ---
-        ddq, dyn = self._compute_M_B_G_F(action)
+        self.dq[0] += ddx * self.dt
+        self.dq[1] += ddy * self.dt
+        self.dq[2] += ddtheta * self.dt
+        self.q[0] += self.dq[0] * self.dt
+        self.q[1] += self.dq[1] * self.dt
+        self.q[2] += self.dq[2] * self.dt
 
-        self.dq = (self.dq.astype(np.float64) + ddq * self.dt).astype(np.float64)
-        self.q = (self.q.astype(np.float64) + self.dq * self.dt).astype(np.float64)
+        foot_pos = self.get_foot_pos()
+        foot_y = foot_pos[1]
+        foot_x = foot_pos[0]
 
-        # State cleaning
-        self.q = np.clip(self.q, -1e5, 1e5)
-        self.dq = np.clip(self.dq, -1e3, 1e3)
-        self.q[2] = (self.q[2] + math.pi) % (2 * math.pi) - math.pi
+        reward = 0.0
+        terminated = False
+        truncated = False
+
+        # ==========================================
+        # 奖励函数修改 (核心修改区域)
+        # ==========================================
+
+        # 1. 存活奖励 (保持不变)
+        reward += 0.01
+
+        # 2. 距离惩罚/奖励 (改用更平滑的引导)
+        # 之前是 +0.2 * dx，这会鼓励它无脑冲。改为鼓励"靠近目标"
+        dist_to_target = abs(foot_x - self.targets[self.current_target_idx])
+        reward += (1.0 / (dist_to_target + 0.1)) * 0.1
+
+        # 3. [新增] 高度惩罚 (Ceiling Penalty)
+        # 强迫它不要飞太高。理想跳跃高度约为 1.5m - 2.0m (机身高度)
+        # 如果超过 2.5m，给予巨大惩罚
+        if self.q[1] > 2.5:
+            reward -= 1.0  # 每一步都扣，很疼
+
+        # 4. [修改] 能耗惩罚 (Energy Penalty)
+        # 大幅增加油门成本，迫使它利用被动弹跳而不是主动飞行
+        # 之前是 0.001，现在改为 0.05 (增加50倍)
+        reward -= 0.7 * np.sum(action ** 2)
+
+        # 5. [新增] 姿态惩罚 (Stability)
+        # 稍微加强对倾斜的惩罚，防止乱翻
+        reward -= 2.0 * abs(self.q[2])
+
+        # ==========================================
+        # 触地逻辑 (Raibert Pogo Physics)
+        # ==========================================
+        if foot_y <= self.ground_y and self.dq[1] < 0:  # 触地
+
+            # 只有触地时，能获得"反弹奖励"
+            # 这鼓励 AI 主动去触地，因为这是获得动量最"便宜"的方式(Raibert模型免费给速度)
+            reward += 2.0
+
+            if dist_to_target < self.target_tolerance:
+                reward += 5.0  # 到达奖励
+                print(f"🎯 踩中目标! Dist: {dist_to_target:.3f}")
+                if self.current_target_idx == 1:
+                    terminated = True
+                    reward += 10.0  # 最终大奖
+                else:
+                    self.current_target_idx += 1
+
+            # Raibert 物理 (瞬间反弹)
+            # 这是一个"魔法"物理，不消耗电能就能获得向上的速度
+            # AI 会发现：用电机飞很贵(扣分)，撞地反弹免费(给分且给速度)，所以它会选择跳。
+            h_target = 1.5  # 目标弹跳高度
+            v_launch = math.sqrt(2 * self.g * h_target)
+            self.dq[1] = v_launch
+
+            # 触地时修正水平速度和角速度 (模拟摩擦和控制)
+            self.dq[0] -= 2.0 * theta
+            self.dq[2] -= 5.0 * theta
+
+            # 防止穿模
+            self.q[1] = self.ground_y + self.l0 * math.cos(theta) + 0.01
+
+        # ==========================================
+        # 终止条件 (Termination)
+        # ==========================================
+        # 1. 摔倒 (高度太低 或 角度太大)
+        # 注意：因为腿长1.0m，机身高度 < 0.5 肯定已经摔了
+        if self.q[1] < 0.5 or abs(self.q[2]) > math.radians(60):
+            terminated = True
+            reward -= 50.0  # 摔倒惩罚
+
+        # 2. [新增] 飞出天际 (Fly Away)
+        # 如果飞得太高(比如超过4米)，直接判负并结束
+        if self.q[1] > 4.0:
+            terminated = True
+            reward -= 100.0
+            print("❌ 飞太高了，判定为失控")
 
         self.steps += 1
+        if self.steps >= self.max_episode_steps:
+            truncated = True
 
-        done = False
-        landed = False
+        info = {"current_target": self.current_target_idx}
+        return self._get_obs(), reward, terminated, truncated, info
 
-        # Termination conditions
-        if self.q[1] <= 0.0:
-            done = True
-            landed = True
-            self.q[1] = 0.0
-            self.dq[:] = 0.0
-        elif self.steps >= self.max_steps:
-            done = True
-        elif abs(self.q[2]) > math.pi / 1.5:  # Crash/Tumble
-            done = True
+    def render(self):
+        pass
 
-        # --- 4. Reward Calculation (Prompt Specifics) ---
-        reward = 0.0
-
-        if self.phase == 1:
-            # Phase 1: Active Thrust Targeting
-            reward -= 0.05 * np.sum(action)
-
-        if self.phase == 1:
-            # Phase 1 核心目标：匹配弹道速度 v_req
-            # 如果不可行（feasible=False），说明角度不对，给予负反馈
-            if feasible:
-                v_err = abs(current_v - v_req)
-                reward += 1.0 * np.exp(-2.0 * v_err)
-                # 额外奖励：如果当前的垂直速度 vz 和水平速度 vx 比例正确
-                # 这里我们简单一点，只奖励 v_req 匹配度
-            else:
-                # 角度极其离谱导致无解，给惩罚
-                reward -= 0.5
-
-        else:
-            # Phase 2 核心目标：姿态控制准备着陆
-            phi_err = abs(self.q[2] - self.target_phi)
-            reward += 0.5 * np.exp(-5.0 * phi_err)
-            # 惩罚角速度，保持平稳
-            reward -= 0.02 * abs(self.dq[2])
-
-            # 引导它往目标落点去 (只在 Phase 2 引导，防止 Phase 1 干扰弹道计算)
-            dist_to_target = abs(self.q[0] - self.target_x)
-            reward += 1.0 * np.exp(-2.0 * dist_to_target)
-
-        # Terminal Reward
-        if done:
-            if landed:
-                pos_err_x = abs(self.q[0] - self.target_x)
-                phi_err = abs(self.q[2] - self.target_phi)
-
-                # Conditional: High reward only if passed R (handled by phase check indirectly)
-                # Landing Accuracy
-                if pos_err_x < 0.2:
-                    reward += 15.0
-                    reward += (0.2 - pos_err_x) * 20.0  # Precision bonus
-                else:
-                    reward -= 5.0 * pos_err_x
-
-                # Landing Attitude
-                if phi_err < 0.2:
-                    reward += 5.0
-                else:
-                    reward -= 10.0  # Bad landing
-            else:
-                reward -= 20.0  # Crash/Timeout
-
-        obs = self._obs()
-        info = {
-            "ddq": ddq.astype(np.float32), "dq": self.dq.astype(np.float32),
-            "landed": landed, "dyn": dyn, "action": np.array(action, dtype=np.int32),
-            "phase": self.phase, "v_req": v_req
-        }
-        self.prev_action = np.array(action, dtype=np.int32)
-        return obs, float(reward), bool(done), info
+    def close(self):
+        pass
 
 
-# PPO (Bernoulli heads)
-if torch is not None:
-    class ActorCritic(nn.Module):
-        def __init__(self, obs_dim=10, hidden=512):  # Updated obs_dim to 6
-            super().__init__()
-            self.actor = nn.Sequential(
-                nn.Linear(obs_dim, hidden),
-                nn.Tanh(),
-                nn.Linear(hidden, hidden),
-                nn.Tanh(),
-                nn.Linear(hidden, 2)
-            )
-            self.critic = nn.Sequential(
-                nn.Linear(obs_dim, hidden),
-                nn.Tanh(),
-                nn.Linear(hidden, hidden),
-                nn.Tanh(),
-                nn.Linear(hidden, 1)
-            )
-            self._initialize_weights()
+if __name__ == '__main__':
+    freeze_support()
 
-        def _initialize_weights(self):
-            for m in self.modules():
-                if isinstance(m, nn.Linear):
-                    nn.init.xavier_uniform_(m.weight)
-                    nn.init.constant_(m.bias, 0.0)
+    MODEL_PATH = "ppo_quadhopper_targets"  # 不带 .zip 后缀
+    TOTAL_TIMESTEPS = 5_000_000
 
-        def forward(self, x):
-            logits = self.actor(x)
-            value = self.critic(x).squeeze(-1)
-            return logits, value
+    # ==================== 选择模式 ====================
+    mode = "test"  # "train_new" / "continue" / "test"
 
+    if mode == "train_new":
+        # 从零开始全新训练
+        print("🚀 从零开始全新训练...")
+        vec_env = make_vec_env(QuadhopperTargetEnv, n_envs=12, vec_env_cls=SubprocVecEnv)
 
-def compute_gae(rewards, values, dones, gamma=0.995, lam=0.95):
-    T = len(rewards)
-    advs = np.zeros(T, dtype=np.float32)
-    lastgaelam = 0.0
-    for t in reversed(range(T)):
-        if t == T - 1:
-            nextnonterminal = 0.0 if dones[t] else 1.0
-            nextvalues = 0.0
-        else:
-            nextnonterminal = 0.0 if dones[t] else 1.0
-            nextvalues = values[t + 1]
-        delta = rewards[t] + gamma * nextvalues * nextnonterminal - values[t]
-        lastgaelam = delta + gamma * lam * nextnonterminal * lastgaelam
-        advs[t] = lastgaelam
-    returns = advs + values
-    advs = (advs - advs.mean()) / (advs.std() + 1e-8)
-    return returns, advs
-
-
-def train_ppo(env,
-              device,
-              num_updates=3000,
-              batch_size=2000,
-              epochs=4,
-              minibatch_size=512,
-              gamma=0.995,
-              lam=0.95,
-              clip_eps=0.2,
-              lr=3e-4,
-              policy_net=None,
-              model_path="ppo_jumping_robot.pt"):
-    if policy_net is None:
-        net = ActorCritic(obs_dim=10).to(device)  # Updated dim
-        print("创建新的 PPO 策略网络")
-    else:
-        net = policy_net
-        print("继续训练已有 PPO 策略网络")
-
-    opt = optim.Adam(net.parameters(), lr=lr)
-    all_rewards = []
-    best_avg = -1e9
-    best_state = None
-
-    for update in range(num_updates):
-        obs_buf, act_buf, logp_buf, rew_buf, val_buf, done_buf = [], [], [], [], [], []
-        steps = 0
-
-        while steps < batch_size:
-            obs = env.reset()
-            done = False
-            ep_r = 0.0
-            while not done and steps < batch_size:
-                o = torch.tensor(obs, dtype=torch.float32, device=device).unsqueeze(0)
-                logits, v = net(o)
-                logits = logits.squeeze(0)
-                v = v.item()
-                dist = torch.distributions.Bernoulli(logits=logits)
-                action = dist.sample().cpu().numpy().astype(np.float32)
-                logp = dist.log_prob(torch.tensor(action, dtype=torch.float32, device=device)).sum().item()
-
-                next_obs, r, done, info = env.step(action)
-
-                obs_buf.append(obs.copy())
-                act_buf.append(action.copy())
-                logp_buf.append(logp)
-                rew_buf.append(r)
-                val_buf.append(v)
-                done_buf.append(done)
-
-                obs = next_obs
-                ep_r += r
-                steps += 1
-                if done:
-                    all_rewards.append(ep_r)
-
-        obs_arr = np.array(obs_buf, dtype=np.float32)
-        act_arr = np.array(act_buf, dtype=np.float32)
-        logp_arr = np.array(logp_buf, dtype=np.float32)
-        rew_arr = np.array(rew_buf, dtype=np.float32)
-        val_arr = np.array(val_buf, dtype=np.float32)
-        done_arr = np.array(done_buf, dtype=np.bool_)
-
-        returns, advs = compute_gae(rew_arr, val_arr, done_arr, gamma, lam)
-
-        idx = np.arange(len(obs_arr))
-        for _ in range(epochs):
-            np.random.shuffle(idx)
-            for st in range(0, len(idx), minibatch_size):
-                mb = idx[st:st + minibatch_size]
-                o = torch.tensor(obs_arr[mb], dtype=torch.float32, device=device)
-                a = torch.tensor(act_arr[mb], dtype=torch.float32, device=device)
-                ol = torch.tensor(logp_arr[mb], dtype=torch.float32, device=device)
-                ad = torch.tensor(advs[mb], dtype=torch.float32, device=device)
-                rt = torch.tensor(returns[mb], dtype=torch.float32, device=device)
-
-                logits, val = net(o)
-                dist = torch.distributions.Bernoulli(logits=logits)
-                new_logp = dist.log_prob(a).sum(dim=-1)
-                ratio = torch.exp(new_logp - ol)
-                s1 = ratio * ad
-                s2 = torch.clamp(ratio, 1.0 - clip_eps, 1.0 + clip_eps) * ad
-                policy_loss = -torch.mean(torch.min(s1, s2))
-                value_loss = torch.mean((rt - val) ** 2)
-                entropy = torch.mean(dist.entropy().sum(dim=-1))
-
-                loss = policy_loss + 0.5 * value_loss - 0.01 * entropy
-                opt.zero_grad()
-                loss.backward()
-                torch.nn.utils.clip_grad_norm_(net.parameters(), 0.5)
-                opt.step()
-
-        avg50 = np.mean(all_rewards[-50:]) if len(all_rewards) else 0.0
-        print(f"[Update {update + 1}/{num_updates}] steps={len(obs_arr)} avg50={avg50:.2f}")
-
-        if avg50 > best_avg:
-            best_avg = avg50
-            best_state = net.state_dict()
-            torch.save(best_state, model_path)
-            print(f"❗️Best Model saving, average reward = {best_avg:.2f}")
-
-    return net, all_rewards, best_avg
-
-
-def rollout_and_render(env, policy_net=None, device=None, max_steps=400, deterministic=False, save_gif=True):
-    frames = []
-    px, py = [], []
-
-    obs = env.reset()
-    done = False
-    steps = 0
-
-    while not done and steps < max_steps:
-        if policy_net is None:
-            action = np.random.binomial(1, 0.5, size=(2,))
-        else:
-            o = torch.tensor(obs, dtype=torch.float32, device=device).unsqueeze(0)
-            with torch.no_grad():
-                logits, _ = policy_net(o)
-            p = torch.sigmoid(logits).squeeze(0).cpu().numpy()
-            action = (p > 0.5).astype(np.int32) if deterministic else np.random.binomial(1, p).astype(np.int32)
-
-        obs, r, done, info = env.step(action)
-        x, y, th = env.q[0], env.q[1], env.q[2]
-        left, right = env.beam_endpoints()
-        tip = (x + math.sin(th) * env.l0, y + math.cos(th) * env.l0)
-
-        frame_data = {
-            'x': x, 'y': y, 'th': th,
-            'left': left, 'right': right, 'tip': tip,
-            'action': action.copy(),
-            'dq': info['dq'].copy(),
-            'ddq': info['ddq'].copy(),
-            'step': steps,
-            'phase': info['phase']
-        }
-        frames.append(frame_data)
-        px.append(x)
-        py.append(y)
-        steps += 1
-
-    fig, ax = plt.subplots(figsize=(10, 8))
-    ax.set_aspect('equal')
-    ax.set_title("Jumping Robot 2D Simulation (Active/Passive Phases)")
-    ax.set_xlim(-1.0, 4)
-    ax.set_ylim(-0.2, 2.5)
-    ax.grid(True, alpha=0.3)
-
-    # --- ONLY CHANGE: Added R and r boundaries visually ---
-    R_circle = plt.Circle((0, 0), np.sqrt(env.R_sq), color='red', fill=False, linestyle='--', linewidth=1.5,
-                          alpha=0.6, label='$R$ (Phase Transition)')
-    r_circle = plt.Circle((0, 0), np.sqrt(env.r_sq), color='blue', fill=False, linestyle=':', linewidth=1.5,
-                          alpha=0.6, label='$r$ (Min Launch)')
-    ax.add_patch(R_circle)
-    ax.add_patch(r_circle)
-    # ----------------------------------------------------
-
-    beam_line, = ax.plot([], [], lw=3, label='Beam', color='black')
-    leg_line, = ax.plot([], [], lw=3, label='Leg', color='black')
-    com_point_m1, = ax.plot([], [], 'ko', markersize=4, label='Body COM')
-    com_point_m2, = ax.plot([], [], 'ko', markersize=4, label='Leg COM')
-    left_dot, = ax.plot([], [], 'o', markersize=5)  # beam 左端点
-    right_dot, = ax.plot([], [], 'o', markersize=5)  # beam 右端点
-    path_line, = ax.plot([], [], 'g--', lw=1, alpha=0.7, label='Trajectory')
-    ground_line, = ax.plot([-1, 4], [0, 0], 'k-', lw=2, label='Ground')
-    target_point, = ax.plot([env.target_x], [0], 'gX', markersize=12, label='Target')
-    info_text = ax.text(0.02, 0.95, "", transform=ax.transAxes, fontsize=10,
-                        bbox=dict(boxstyle="round,pad=0.3", facecolor="white", alpha=0.8))
-    ax.legend(loc='upper right')
-
-    def init():
-        beam_line.set_data([], [])
-        leg_line.set_data([], [])
-        com_point_m2.set_data([], [])
-        com_point_m1.set_data([], [])
-        left_dot.set_data([], [])
-        right_dot.set_data([], [])
-        path_line.set_data([], [])
-        info_text.set_text("")
-        return beam_line, leg_line, com_point_m2, com_point_m1, left_dot, right_dot, path_line, info_text
-
-    def animate(i):
-        if i >= len(frames):
-            return init()
-        frame = frames[i]
-        x, y, th = frame['x'], frame['y'], frame['th']
-        left, right, tip = frame['left'], frame['right'], frame['tip']
-        action = frame['action']
-
-        # beam & leg
-        beam_line.set_data([left[0], right[0]], [left[1], right[1]])
-        leg_line.set_data([x, tip[0]], [y, tip[1]])
-
-        # Color code the beam based on Phase
-        if frame['phase'] == 1:
-            beam_line.set_color('orange')  # Active
-        else:
-            beam_line.set_color('blue')  # Passive
-
-        com_point_m2.set_data([x], [y])
-        com_point_m1.set_data([tip[0]], [tip[1]])
-        path_line.set_data(px[:i + 1], py[:i + 1])
-
-        # 左端点：action[0]
-        left_dot.set_data([left[0]], [left[1]])
-        left_dot.set_color('blue' if action[0] == 0 else 'red')
-
-        # 右端点：action[1]
-        right_dot.set_data([right[0]], [right[1]])
-        right_dot.set_color('blue' if action[1] == 0 else 'red')
-
-        # info text
-        info_text.set_text(
-            f"Step: {frame['step']}\n"
-            f"Phase: {frame['phase']}\n"
-            f"Action: {frame['action']}\n"
-            f"Position: ({x:.2f}, {y:.2f})\n"
-            f"Theta: {math.degrees(th):.1f}°\n"
-            f"Velocity: ({frame['dq'][0]:.2f}, {frame['dq'][1]:.2f})"
+        model = PPO(
+            "MlpPolicy", vec_env, verbose=1,
+            policy_kwargs=dict(activation_fn=th.nn.ReLU, net_arch=dict(pi=[256, 256], vf=[256, 256])),
+            learning_rate=3e-4, n_steps=2048, batch_size=128, n_epochs=10,
+            gamma=0.99, gae_lambda=0.95, clip_range=0.2,
+            tensorboard_log="./quadhopper_ppo_tensorboard/"
         )
-        return beam_line, leg_line, com_point_m2, com_point_m1, left_dot, right_dot, path_line, info_text
 
-    ani = FuncAnimation(fig, animate, frames=len(frames), init_func=init,
-                        interval=50, blit=True, repeat=False)
+        # 可选评估回调
+        callback_on_best = StopTrainingOnRewardThreshold(reward_threshold=320, verbose=1)
+        eval_env = DummyVecEnv([lambda: QuadhopperTargetEnv()])
+        eval_callback = EvalCallback(eval_env, best_model_save_path="./logs/best_model/",
+                                     log_path="./logs/", eval_freq=10000,
+                                     deterministic=True, render=False,
+                                     callback_on_new_best=callback_on_best)
 
-    if save_gif:
-        print("Saving animation as GIF...")
-        ani.save('jumping_robot_simulation_ground.gif', writer=PillowWriter(fps=20))
-        print("GIF saved as 'jumping_robot_simulation_ground.gif'")
+        model.learn(total_timesteps=TOTAL_TIMESTEPS, callback=eval_callback)
+        model.save(MODEL_PATH)
+        print(f"✅ 新训练完成，模型已保存到 {MODEL_PATH}.zip")
 
-    plt.tight_layout()
-    plt.show()
-    return ani
+    elif mode == "continue":
+        # 加载已有模型继续训练
+        if not os.path.exists(MODEL_PATH + ".zip"):
+            raise FileNotFoundError(f"找不到模型文件 {MODEL_PATH}.zip，请先训练或检查路径")
 
+        print("🔄 加载已有模型，继续训练...")
+        vec_env = make_vec_env(QuadhopperTargetEnv, n_envs=12, vec_env_cls=SubprocVecEnv)
+        model = PPO.load(MODEL_PATH, env=vec_env)
 
-# ----------------------------------------------------------------------
-# Main Execution Block
-# ----------------------------------------------------------------------
-if __name__ == "__main__":
-    FORCE_TRAIN = True
-    CONTINUE_TRAIN = False
-    MODEL_PATH = "ppo_jumping_robot.pt"
+        model.learn(total_timesteps=TOTAL_TIMESTEPS, reset_num_timesteps=False)  # 重要：不重置步数计数
+        model.save(MODEL_PATH)
+        print(f"✅ 继续训练完成，模型已更新保存到 {MODEL_PATH}.zip")
 
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    elif mode == "test":
+        # 只加载模型测试 + 录制动画
+        if not os.path.exists(MODEL_PATH + ".zip"):
+            raise FileNotFoundError(f"找不到模型文件 {MODEL_PATH}.zip，请先训练")
 
-    # Configure the Environment with new parameters
-    env = TJumpEnvFlight2DOF(
-        dt=0.005, m1=0.0363, m2=0.01, Jm=0.02,
-        lc=0.25, l0=0.50, g=9.81, thrust=0.314,
-        max_steps=400, target_x=2.0, target_z=0.0,
-        r_radius=0.5, R_radius=1.2  # Defining the boundaries
-    )
+        print("🎬 加载模型进行测试和录制动画...")
+        import matplotlib.pyplot as plt
+        import imageio
 
-    policy_net = None
+        eval_env = DummyVecEnv([lambda: QuadhopperTargetEnv()])
+        model = PPO.load(MODEL_PATH)
 
-    # --- Training/Loading Logic ---
-    if FORCE_TRAIN or not os.path.exists(MODEL_PATH):
-        # Start a new training
-        policy_net = ActorCritic(obs_dim=10).to(device)  # dim 6
-        print("Start a new training...")
-        train_ppo(env, device, num_updates=3000, lr=3e-4, model_path=MODEL_PATH)
+        obs = eval_env.reset()
+        images = []
+        print("正在录制动画（最多1000步）...")
+        import matplotlib.pyplot as plt
+        import matplotlib
+        import imageio
+        import numpy as np
 
-    elif CONTINUE_TRAIN:
-        # Load and continue training
-        print(f"Load an existing model and continue training: {MODEL_PATH}")
-        policy_net = ActorCritic(obs_dim=10).to(device)
-        policy_net.load_state_dict(torch.load(
-            MODEL_PATH, map_location=device, weights_only=True
-        ))
-        policy_net.train()
-        train_ppo(env, device, num_updates=2000, lr=1e-4, policy_net=policy_net, model_path=MODEL_PATH)
+        # 强制使用非交互后端，避免 macosx 后端问题
+        matplotlib.use('Agg')  # 关键！无窗口、无交互、纯离屏渲染
 
-    else:
-        # Load for inference
-        print(f"Load the best existing model for inference: {MODEL_PATH}")
-        policy_net = ActorCritic(obs_dim=10).to(device)
-        policy_net.load_state_dict(torch.load(
-            MODEL_PATH, map_location=device, weights_only=True
-        ))
-        policy_net.eval()
+        WIDTH, HEIGHT = 1000, 500  # 我们想要的固定像素尺寸
 
-    # --- Run Simulation ---
-    rollout_and_render(env, policy_net=policy_net, device=device,
-                       deterministic=True, save_gif=True)
+        for i in range(1000):
+            action, _ = model.predict(obs, deterministic=True)
+            obs, reward, done, info = eval_env.step(action)
+
+            # ... (前文代码不变)
+
+            # 创建固定大小的图
+            fig = plt.figure(figsize=(WIDTH / 100, HEIGHT / 100), dpi=100)
+            ax = fig.add_subplot(111)
+
+            # 调整视野范围 (因为腿长变成了1.0，跳得更高了，视野要放大)
+            ax.set_xlim(obs[0][0] - 3, obs[0][0] + 7)  # 视野放宽
+            ax.set_ylim(-1.5, 3.5)  # 高度放宽 (腿长1m + 跳跃高度)
+            ax.set_aspect('equal')
+            ax.grid(True, alpha=0.3)
+
+            x, y, theta = obs[0][0], obs[0][1], obs[0][2]
+
+            # === 使用新的物理尺寸进行绘制 ===
+            # 获取环境中的真实尺寸 (如果无法直接获取，手动填入 0.177 和 1.0)
+            draw_lc = 0.177  # 对应 self.lc
+            draw_l0 = 1.0  # 对应 self.l0
+
+            # 绘制机臂 (Body)
+            xl = x - draw_lc * math.cos(theta)
+            yl = y - draw_lc * math.sin(theta)
+            xr = x + draw_lc * math.cos(theta)
+            yr = y + draw_lc * math.sin(theta)
+
+            # 绘制腿 (Leg)
+            # 注意: 这里使用你在 get_foot_pos 中的逻辑
+            foot_x = x + draw_l0 * math.sin(theta)
+            foot_y = y - draw_l0 * math.cos(theta)
+
+            ax.plot([-10, 20], [0, 0], 'k-', lw=2)  # 地面
+            ax.plot([xl, xr], [yl, yr], 'k-', lw=4)  # 机身 (加粗)
+            ax.plot([x, foot_x], [y, foot_y], 'b-', lw=2)  # 腿
+            ax.plot([foot_x], [foot_y], 'ro', markersize=8)  # 脚 (圆球加大)
+            ax.plot([xl], [yl], 'go', markersize=6)  # 左电机
+            ax.plot([xr], [yr], 'go', markersize=6)  # 右电机
+
+            current_target_x = 4.0 if info[0]['current_target'] == 1 else 2.0
+            ax.set_title(f"Step {i} | Vel X: {obs[0][4]:.2f} m/s | Next Target: {current_target_x:.1f} m")
+
+            # 渲染到固定大小的 buffer
+            fig.canvas.draw()
+            image = np.frombuffer(fig.canvas.tostring_rgb(), dtype='uint8')
+            image = image.reshape((HEIGHT, WIDTH, 3))  # 直接强制 reshape 到我们想要的尺寸
+
+            images.append(image)
+            plt.close(fig)
+
+            if done[0]:
+                print("Episode 结束")
+                break
+
+        imageio.mimsave('quadhopper_trained_demo.gif', images, fps=50)
+        print("✅ 动画已成功保存为 'quadhopper_trained_demo.gif‘")
