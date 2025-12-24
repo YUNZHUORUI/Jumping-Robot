@@ -11,103 +11,79 @@ import torch as th
 from multiprocessing import freeze_support  # Windows 需要这个，但 macOS 无害
 import os
 
+
 class QuadhopperTargetEnv(gym.Env):
     metadata = {"render_modes": ["human", "rgb_array"], "render_fps": 30}
+
     def __init__(self, render_mode=None):
         super().__init__()
         self.render_mode = render_mode
 
-        # ==========================================
-        # 1. 物理参数 (基于 cf2.xml 更新)
-        # ==========================================
+        # ==================== 物理参数 ====================
         self.dt = 0.005
-
-        # 质量: Body(1.1) + Foot(0.11)
         self.m = 1.21
-
-        # 腿长: 基于 pos="0 0 -1.0"
         self.l0 = 1.0
-
-        # 力臂 (半宽): 基于 motor_site pos="0.1768"
         self.lc = 0.177
-
-        # 转动惯量: 基于 diaginertia="0.15 ..."
         self.J = 0.15
-
         self.g = 9.81
-
-        # 推力: 单电机15N * 2 (双桨合并) = 30N
         self.max_thrust = 30.0
-
-        # 弹簧参数 (虽然当前step用的是Raibert跳跃, 但建议存着)
-        self.k_spring = 150.0
-        self.c_damping = 1.0
-
         self.ground_y = 0.0
 
-        # ==========================================
-        # 2. 目标与空间设置 (保持逻辑不变)
-        # ==========================================
-        # 两个固定目标 (因为腿变长了1.0m, 步幅变大，建议稍微拉远目标距离)
-        self.targets = np.array([2.0, 4.0])
-        self.target_tolerance = 0.20  # 适当放宽判定范围
+        # ==================== 目标设置 ====================
+        # 稍微拉开距离，测试它的长距离跳跃能力
+        self.targets = np.array([3.0, 7.0])
+        self.target_tolerance = 0.15  # 收紧判定范围 (之前是 0.20)
 
-        # Action: 左右油门 [0,1]
+        # Action: [Left Thrust, Right Thrust]
         self.action_space = spaces.Box(low=0.0, high=1.0, shape=(2,), dtype=np.float32)
 
-        # Observation
+        # Observation: 增加 explicit distance
+        # [x, y, theta, l, dx, dy, dtheta, dl, dist_to_target, target_idx]
         self.observation_space = spaces.Box(low=-np.inf, high=np.inf, shape=(10,), dtype=np.float32)
 
         self.current_target_idx = 0
         self.steps = 0
         self.max_episode_steps = 2000
 
+        # 记录上一步的距离，用于计算 Potential Reward
+        self.prev_dist = 0.0
+
     def reset(self, seed=None, options=None):
         super().reset(seed=seed)
-
         if seed is not None:
             np.random.seed(seed)
 
-        # 1. 随机初始化角度 (Theta)
-        init_theta = np.random.uniform(math.radians(-60), math.radians(-30))
-
-        # 2. 计算最小安全高度 (Min Safe Height)
-        # 腿完全伸直时的垂直长度 = l0 * cos(theta)
+        # 初始向右倾斜 (-45 ~ -20度)，准备起跑
+        init_theta = np.random.uniform(math.radians(-45), math.radians(-20))
         leg_vertical_height = self.l0 * math.cos(init_theta)
 
-        # 3. 随机初始化高度 (Y)
-        # 我们需要在腿长基础上，再加一点"悬空高度"，让它落下来积蓄能量
-        init_y = np.random.uniform(1.2, 1.5)
+        # 初始高度
+        init_y = max(1.3, leg_vertical_height + 0.2)
 
-        # 确保无论如何 y 都要比腿长高 (防止插地)
-        init_y = max(init_y, leg_vertical_height + 0.1)
+        self.q = np.array([0.0, init_y, init_theta, self.l0], dtype=np.float64)
 
-        self.q = np.array([
-            0.0,  # x: 从 0 开始
-            init_y,  # y: 修改后的高度
-            init_theta,  # theta: 修改后的前倾角度
-            self.l0  # l: 腿长 1.0
-        ], dtype=np.float64)
-
-        # 4. 初始化速度
-        # 可以稍微给一点向下的初速度，模拟"扔下来"的感觉，或者设为0
+        # 初始给一点点向前的速度，帮助启动
         self.dq = np.array([
-            np.random.uniform(0.0, 5.0),  # dx: 稍微给一点点向前的初速度
-            np.random.uniform(0.0, 5.0),  # dy: 稍微给一点向下的初速度(砸向地面)
-            0.0,  # dtheta
-            0.0  # dl
+            np.random.uniform(0.0, 4.0),  # dx
+            np.random.uniform(0.0, 4.0),  # dy (向下)
+            0.0, 0.0
         ], dtype=np.float64)
 
         self.current_target_idx = 0
         self.steps = 0
 
+        # 初始化距离记录
+        foot_x = self.get_foot_pos()[0]
+        self.prev_dist = abs(foot_x - self.targets[self.current_target_idx])
+
         return self._get_obs(), {}
 
     def _get_obs(self):
-        rel_x_to_next = self.targets[self.current_target_idx] - self.q[0]
+        # 显式计算距离，让神经网络直接看到"还有多远"
+        dist_to_next = self.targets[self.current_target_idx] - self.get_foot_pos()[0]
         return np.concatenate([
             self.q, self.dq,
-            [rel_x_to_next, float(self.current_target_idx)]
+            [dist_to_next, float(self.current_target_idx)]
         ]).astype(np.float32)
 
     def get_foot_pos(self):
@@ -117,6 +93,7 @@ class QuadhopperTargetEnv(gym.Env):
         return np.array([x_f, y_f])
 
     def step(self, action):
+        # ==================== 物理计算 ====================
         u1 = np.clip(action[0], 0.0, 1.0)
         u2 = np.clip(action[1], 0.0, 1.0)
         F1 = u1 * self.max_thrust
@@ -138,88 +115,97 @@ class QuadhopperTargetEnv(gym.Env):
         self.q[1] += self.dq[1] * self.dt
         self.q[2] += self.dq[2] * self.dt
 
+        # ==================== 状态更新 ====================
         foot_pos = self.get_foot_pos()
-        foot_y = foot_pos[1]
-        foot_x = foot_pos[0]
+        foot_x, foot_y = foot_pos[0], foot_pos[1]
+
+        target_x = self.targets[self.current_target_idx]
+        dist_to_target = abs(foot_x - target_x)
 
         reward = 0.0
         terminated = False
         truncated = False
 
-        # ==========================================
-        # 奖励函数修改 (核心修改区域)
-        # ==========================================
+        # ==================== 核心奖励设计 (Reward Shaping) ====================
 
-        # 1. 存活奖励 (保持不变)
-        reward += 0.01
+        # 1. 基础生存与距离引导 (Potential Field)
+        # 如果这一步比上一步离目标更近，给正奖励；反之给负奖励。
+        # 这比直接给距离绝对值更有效，能引导梯度。
+        progress = self.prev_dist - dist_to_target
+        reward += 10.0 * progress
+        self.prev_dist = dist_to_target
 
-        # 2. 距离惩罚/奖励 (改用更平滑的引导)
-        # 之前是 +0.2 * dx，这会鼓励它无脑冲。改为鼓励"靠近目标"
-        dist_to_target = abs(foot_x - self.targets[self.current_target_idx])
-        reward += (1.0 / (dist_to_target + 0.1)) * 0.1
+        # 2. 严厉的能耗惩罚 (Energy Efficiency)
+        # 我们惩罚 action 的平方，但惩罚系数加大
+        # 此外，如果高度 > 1.5m (弹道顶点附近)，额外加重推力惩罚，强迫它在空中"闭嘴"，只靠惯性
+        thrust_cost = np.sum(action ** 2)
+        if self.q[1] > 1.5:
+            reward -= 0.5 * thrust_cost  # 高空推力惩罚 x 5
+        else:
+            reward -= 0.1 * thrust_cost  # 低空正常惩罚
 
-        # 3. [新增] 高度惩罚 (Ceiling Penalty)
-        # 强迫它不要飞太高。理想跳跃高度约为 1.5m - 2.0m (机身高度)
-        # 如果超过 2.5m，给予巨大惩罚
-        if self.q[1] > 2.5:
-            reward -= 1.0  # 每一步都扣，很疼
+        # 3. 姿态稳定惩罚
+        # 惩罚过大的角速度和角度，防止它在空中乱翻
+        reward -= 0.05 * abs(self.dq[2])
+        reward -= 0.1 * abs(self.q[2])
 
-        # 4. [修改] 能耗惩罚 (Energy Penalty)
-        # 大幅增加油门成本，迫使它利用被动弹跳而不是主动飞行
-        # 之前是 0.001，现在改为 0.05 (增加50倍)
-        reward -= 0.7 * np.sum(action ** 2)
+        # ==================== 触地与弹跳逻辑 ====================
+        if foot_y <= self.ground_y and self.dq[1] < 0:
 
-        # 5. [新增] 姿态惩罚 (Stability)
-        # 稍微加强对倾斜的惩罚，防止乱翻
-        reward -= 2.0 * abs(self.q[2])
+            # A. 精准落点奖励 (Gaussian Kernel)
+            # 只有非常接近目标时，这个值才会接近 1。
+            # sigma=0.5 意味着误差在 0.5m 以内才有明显分数
+            accuracy_bonus = 20.0 * np.exp(-(dist_to_target ** 2) / 0.15)
+            reward += accuracy_bonus
 
-        # ==========================================
-        # 触地逻辑 (Raibert Pogo Physics)
-        # ==========================================
-        if foot_y <= self.ground_y and self.dq[1] < 0:  # 触地
-
-            # 只有触地时，能获得"反弹奖励"
-            # 这鼓励 AI 主动去触地，因为这是获得动量最"便宜"的方式(Raibert模型免费给速度)
-            reward += 2.0
-
+            # B. 目标达成逻辑
             if dist_to_target < self.target_tolerance:
-                reward += 5.0  # 到达奖励
-                print(f"🎯 踩中目标! Dist: {dist_to_target:.3f}")
+                reward += 100.0  # 踩中大奖
+                print(
+                    f"🎯 Hit Target {self.current_target_idx} | Error: {dist_to_target:.3f}m | Thrust Avg: {np.mean(action):.2f}")
+
                 if self.current_target_idx == 1:
                     terminated = True
-                    reward += 10.0  # 最终大奖
+                    reward += 500.0  # 通关大奖
                 else:
                     self.current_target_idx += 1
+                    # 重置距离记录，防止下一个目标的距离突变导致巨大的负 progress
+                    self.prev_dist = abs(foot_x - self.targets[self.current_target_idx])
 
-            # Raibert 物理 (瞬间反弹)
-            # 这是一个"魔法"物理，不消耗电能就能获得向上的速度
-            # AI 会发现：用电机飞很贵(扣分)，撞地反弹免费(给分且给速度)，所以它会选择跳。
-            h_target = 1.5  # 目标弹跳高度
-            v_launch = math.sqrt(2 * self.g * h_target)
-            self.dq[1] = v_launch
+            # C. 物理反弹 (Raibert Hopping Physics)
+            # 修正：让水平速度的变化更加物理化
+            # 我们不再强制赋值 self.dq[0]，而是模拟地面摩擦力和反弹力
 
-            # 触地时修正水平速度和角速度 (模拟摩擦和控制)
-            self.dq[0] -= 2.0 * theta
-            self.dq[2] -= 5.0 * theta
+            # 垂直反弹：能量补充 (Pogo Stick 核心)
+            # 设定一个固定的弹跳高度目标
+            h_bounce = 2.0
+            v_rebound = math.sqrt(2 * self.g * h_bounce)
+            self.dq[1] = v_rebound
+
+            # 水平反弹：
+            # 之前的代码: self.dq[0] -= 2.0 * theta (硬编码)
+            # 改进: 依然保留这个机制，因为它是单腿机器人的控制核心(把腿往前伸，就能减速/向后跳)
+            # 但我们减小系数，让 AI 更多依赖空中的姿态调整，而不是依靠近地面的"魔法修正"
+            # 这里的逻辑是：Forward Lean (theta < 0) -> Adds forward velocity
+            # Backward Lean (theta > 0) -> Reduces forward velocity
+            self.dq[0] -= 3.0 * theta
+
+            # 角速度阻尼 (模拟触地瞬间的稳定化)
+            self.dq[2] *= 0.5
 
             # 防止穿模
             self.q[1] = self.ground_y + self.l0 * math.cos(theta) + 0.01
 
-        # ==========================================
-        # 终止条件 (Termination)
-        # ==========================================
-        # 1. 摔倒 (高度太低 或 角度太大)
-        # 注意：因为腿长1.0m，机身高度 < 0.5 肯定已经摔了
-        if self.q[1] < 0.5 or abs(self.q[2]) > math.radians(60):
+        # ==================== 终止条件 ====================
+        # 1. 摔倒
+        if self.q[1] < 0.2 or abs(self.q[2]) > math.radians(70):
             terminated = True
             reward -= 50.0  # 摔倒惩罚
 
-        # 2. [新增] 飞出天际 (Fly Away)
-        # 如果飞得太高(比如超过4米)，直接判负并结束
+        # 2. 飞天 (超过 4m 判负)
         if self.q[1] > 4.0:
             terminated = True
             reward -= 100.0
-            print("❌ 飞太高了，判定为失控")
 
         self.steps += 1
         if self.steps >= self.max_episode_steps:
@@ -231,137 +217,118 @@ class QuadhopperTargetEnv(gym.Env):
     def render(self):
         pass
 
-    def close(self):
-        pass
-
 
 if __name__ == '__main__':
     freeze_support()
 
-    MODEL_PATH = "ppo_quadhopper_targets"  # 不带 .zip 后缀
-    TOTAL_TIMESTEPS = 5_000_000
+    MODEL_PATH = "ppo_quadhopper_precise"
+    TOTAL_TIMESTEPS = 3_000_000
 
-    # ==================== 选择模式 ====================
-    mode = "test"  # "train_new" / "continue" / "test"
+    mode = "train_new"  # 建议使用 train_new 重新适应新的奖励函数
 
     if mode == "train_new":
-        # 从零开始全新训练
-        print("🚀 从零开始全新训练...")
+        print("🚀 开始高精度训练...")
+        # 增加环境数量加速训练
         vec_env = make_vec_env(QuadhopperTargetEnv, n_envs=12, vec_env_cls=SubprocVecEnv)
 
         model = PPO(
             "MlpPolicy", vec_env, verbose=1,
+            # 网络稍微加宽，以处理更复杂的精细控制
             policy_kwargs=dict(activation_fn=th.nn.ReLU, net_arch=dict(pi=[256, 256], vf=[256, 256])),
-            learning_rate=3e-4, n_steps=2048, batch_size=128, n_epochs=10,
-            gamma=0.99, gae_lambda=0.95, clip_range=0.2,
-            tensorboard_log="./quadhopper_ppo_tensorboard/"
+            learning_rate=3e-4,
+            n_steps=2048,
+            batch_size=128,
+            gamma=0.99,
+            # 熵系数(ent_coef)稍微调高，增加探索，防止过早陷入"飞过去"的局部最优
+            ent_coef=0.01,
+            tensorboard_log="./quadhopper_log/"
         )
 
-        # 可选评估回调
-        callback_on_best = StopTrainingOnRewardThreshold(reward_threshold=320, verbose=1)
-        eval_env = DummyVecEnv([lambda: QuadhopperTargetEnv()])
-        eval_callback = EvalCallback(eval_env, best_model_save_path="./logs/best_model/",
-                                     log_path="./logs/", eval_freq=10000,
-                                     deterministic=True, render=False,
-                                     callback_on_new_best=callback_on_best)
-
-        model.learn(total_timesteps=TOTAL_TIMESTEPS, callback=eval_callback)
+        model.learn(total_timesteps=TOTAL_TIMESTEPS)
         model.save(MODEL_PATH)
-        print(f"✅ 新训练完成，模型已保存到 {MODEL_PATH}.zip")
-
-    elif mode == "continue":
-        # 加载已有模型继续训练
-        if not os.path.exists(MODEL_PATH + ".zip"):
-            raise FileNotFoundError(f"找不到模型文件 {MODEL_PATH}.zip，请先训练或检查路径")
-
-        print("🔄 加载已有模型，继续训练...")
-        vec_env = make_vec_env(QuadhopperTargetEnv, n_envs=12, vec_env_cls=SubprocVecEnv)
-        model = PPO.load(MODEL_PATH, env=vec_env)
-
-        model.learn(total_timesteps=TOTAL_TIMESTEPS, reset_num_timesteps=False)  # 重要：不重置步数计数
-        model.save(MODEL_PATH)
-        print(f"✅ 继续训练完成，模型已更新保存到 {MODEL_PATH}.zip")
+        print("✅ 训练完成")
 
     elif mode == "test":
-        # 只加载模型测试 + 录制动画
-        if not os.path.exists(MODEL_PATH + ".zip"):
-            raise FileNotFoundError(f"找不到模型文件 {MODEL_PATH}.zip，请先训练")
-
-        print("🎬 加载模型进行测试和录制动画...")
-        import matplotlib.pyplot as plt
-        import imageio
-
-        eval_env = DummyVecEnv([lambda: QuadhopperTargetEnv()])
-        model = PPO.load(MODEL_PATH)
-
-        obs = eval_env.reset()
-        images = []
-        print("正在录制动画（最多1000步）...")
+        print("🎬 生成演示动画...")
         import matplotlib.pyplot as plt
         import matplotlib
         import imageio
-        import numpy as np
 
-        # 强制使用非交互后端，避免 macosx 后端问题
-        matplotlib.use('Agg')  # 关键！无窗口、无交互、纯离屏渲染
+        matplotlib.use('Agg')
 
-        WIDTH, HEIGHT = 1000, 500  # 我们想要的固定像素尺寸
+        if not os.path.exists(MODEL_PATH + ".zip"):
+            print("找不到模型，请先训练！")
+            exit()
 
-        for i in range(1000):
+        model = PPO.load(MODEL_PATH)
+        env = QuadhopperTargetEnv()
+        obs, _ = env.reset()
+
+        frames = []
+        WIDTH, HEIGHT = 1000, 500
+
+        print("正在渲染...")
+        for i in range(800):
             action, _ = model.predict(obs, deterministic=True)
-            obs, reward, done, info = eval_env.step(action)
+            obs, reward, done, _, info = env.step(action)
 
-            # ... (前文代码不变)
-
-            # 创建固定大小的图
             fig = plt.figure(figsize=(WIDTH / 100, HEIGHT / 100), dpi=100)
             ax = fig.add_subplot(111)
 
-            # 调整视野范围 (因为腿长变成了1.0，跳得更高了，视野要放大)
-            ax.set_xlim(obs[0][0] - 3, obs[0][0] + 7)  # 视野放宽
-            ax.set_ylim(-1.5, 3.5)  # 高度放宽 (腿长1m + 跳跃高度)
+            # 动态跟随视角
+            cx = obs[0]  # Body X
+            ax.set_xlim(cx - 4, cx + 6)
+            ax.set_ylim(-1.0, 4.0)
             ax.set_aspect('equal')
             ax.grid(True, alpha=0.3)
 
-            x, y, theta = obs[0][0], obs[0][1], obs[0][2]
+            # 绘制目标
+            targets = env.targets
+            for t_idx, tx in enumerate(targets):
+                color = 'r' if t_idx == info['current_target'] else 'gray'
+                # 画出目标点
+                ax.plot(tx, 0, marker='x', color=color, markersize=10, markeredgewidth=3)
+                # 画出判定范围
+                ax.add_patch(
+                    plt.Rectangle((tx - env.target_tolerance, -0.05), env.target_tolerance * 2, 0.1, color=color,
+                                  alpha=0.3))
 
-            # === 使用新的物理尺寸进行绘制 ===
-            # 获取环境中的真实尺寸 (如果无法直接获取，手动填入 0.177 和 1.0)
-            draw_lc = 0.177  # 对应 self.lc
-            draw_l0 = 1.0  # 对应 self.l0
+            # 绘制机器人
+            x, y, theta = obs[0], obs[1], obs[2]
+            lc, l0 = env.lc, env.l0
 
-            # 绘制机臂 (Body)
-            xl = x - draw_lc * math.cos(theta)
-            yl = y - draw_lc * math.sin(theta)
-            xr = x + draw_lc * math.cos(theta)
-            yr = y + draw_lc * math.sin(theta)
+            # 机身
+            xl = x - lc * math.cos(theta)
+            yl = y - lc * math.sin(theta)
+            xr = x + lc * math.cos(theta)
+            yr = y + lc * math.sin(theta)
 
-            # 绘制腿 (Leg)
-            # 注意: 这里使用你在 get_foot_pos 中的逻辑
-            foot_x = x + draw_l0 * math.sin(theta)
-            foot_y = y - draw_l0 * math.cos(theta)
+            # 腿
+            foot_x = x + l0 * math.sin(theta)
+            foot_y = y - l0 * math.cos(theta)
 
-            ax.plot([-10, 20], [0, 0], 'k-', lw=2)  # 地面
-            ax.plot([xl, xr], [yl, yr], 'k-', lw=4)  # 机身 (加粗)
-            ax.plot([x, foot_x], [y, foot_y], 'b-', lw=2)  # 腿
-            ax.plot([foot_x], [foot_y], 'ro', markersize=8)  # 脚 (圆球加大)
-            ax.plot([xl], [yl], 'go', markersize=6)  # 左电机
-            ax.plot([xr], [yr], 'go', markersize=6)  # 右电机
+            ax.plot([-100, 100], [0, 0], 'k-', lw=2)  # 地面
+            ax.plot([xl, xr], [yl, yr], 'k-', lw=5)  # 机身
+            ax.plot([x, foot_x], [y, foot_y], 'b-', lw=3)  # 腿
 
-            current_target_x = 4.0 if info[0]['current_target'] == 1 else 2.0
-            ax.set_title(f"Step {i} | Vel X: {obs[0][4]:.2f} m/s | Next Target: {current_target_x:.1f} m")
+            # 喷气效果 (Visualizing Thrust)
+            thrust_scale = 1.0
+            if action[0] > 0.05:  # 左电机喷气
+                ax.arrow(xl, yl, 0, -action[0] * thrust_scale, head_width=0.1, color='orange')
+            if action[1] > 0.05:  # 右电机喷气
+                ax.arrow(xr, yr, 0, -action[1] * thrust_scale, head_width=0.1, color='orange')
 
-            # 渲染到固定大小的 buffer
+            ax.set_title(f"Step {i} | Vel X: {obs[4]:.2f} | Dist: {obs[8]:.2f} | Thrust: {np.mean(action):.2f}")
+
             fig.canvas.draw()
             image = np.frombuffer(fig.canvas.tostring_rgb(), dtype='uint8')
-            image = image.reshape((HEIGHT, WIDTH, 3))  # 直接强制 reshape 到我们想要的尺寸
-
-            images.append(image)
+            image = image.reshape((HEIGHT, WIDTH, 3))
+            frames.append(image)
             plt.close(fig)
 
-            if done[0]:
-                print("Episode 结束")
+            if done:
+                print("Reach Goal or Fail")
                 break
 
-        imageio.mimsave('quadhopper_trained_demo.gif', images, fps=50)
-        print("✅ 动画已成功保存为 'quadhopper_trained_demo.gif‘")
+        imageio.mimsave('quadhopper_precise.gif', frames, fps=50)
+        print("✅ GIF Saved")
