@@ -321,7 +321,7 @@ if __name__ == '__main__':
             ax.set_title(f"Step {i} | Vel X: {obs[4]:.2f} | Dist: {obs[8]:.2f} | Thrust: {np.mean(action):.2f}")
 
             fig.canvas.draw()
-            image = np.frombuffer(fig.canvas.tostring_rgb(), dtype='uint8')
+            image = np.frombuffer(fig.canvas.tostring_argb(), dtype='uint8')
             image = image.reshape((HEIGHT, WIDTH, 3))
             frames.append(image)
             plt.close(fig)
