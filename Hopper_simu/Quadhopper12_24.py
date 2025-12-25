@@ -132,7 +132,7 @@ class QuadhopperTargetEnv(gym.Env):
         # 如果这一步比上一步离目标更近，给正奖励；反之给负奖励。
         # 这比直接给距离绝对值更有效，能引导梯度。
         progress = self.prev_dist - dist_to_target
-        reward += 10.0 * progress
+        reward += 5.0 * progress
         self.prev_dist = dist_to_target
 
         # 2. 严厉的能耗惩罚 (Energy Efficiency)
@@ -140,7 +140,7 @@ class QuadhopperTargetEnv(gym.Env):
         # 此外，如果高度 > 1.5m (弹道顶点附近)，额外加重推力惩罚，强迫它在空中"闭嘴"，只靠惯性
         thrust_cost = np.sum(action ** 2)
         if self.q[1] > 1.5:
-            reward -= 0.5 * thrust_cost  # 高空推力惩罚 x 5
+            reward -= 0.7 * thrust_cost  # 高空推力惩罚 x 5
         else:
             reward -= 0.1 * thrust_cost  # 低空正常惩罚
 
@@ -160,13 +160,13 @@ class QuadhopperTargetEnv(gym.Env):
 
             # B. 目标达成逻辑
             if dist_to_target < self.target_tolerance:
-                reward += 100.0  # 踩中大奖
+                reward += 10.0  # 踩中大奖
                 print(
                     f"🎯 Hit Target {self.current_target_idx} | Error: {dist_to_target:.3f}m | Thrust Avg: {np.mean(action):.2f}")
 
                 if self.current_target_idx == 1:
                     terminated = True
-                    reward += 500.0  # 通关大奖
+                    reward += 50.0  # 通关大奖
                 else:
                     self.current_target_idx += 1
                     # 重置距离记录，防止下一个目标的距离突变导致巨大的负 progress
@@ -200,12 +200,12 @@ class QuadhopperTargetEnv(gym.Env):
         # 1. 摔倒
         if self.q[1] < 0.2 or abs(self.q[2]) > math.radians(70):
             terminated = True
-            reward -= 50.0  # 摔倒惩罚
+            reward -= 10.0  # 摔倒惩罚
 
         # 2. 飞天 (超过 4m 判负)
         if self.q[1] > 4.0:
             terminated = True
-            reward -= 100.0
+            reward -= 10.0
 
         self.steps += 1
         if self.steps >= self.max_episode_steps:
@@ -224,7 +224,7 @@ if __name__ == '__main__':
     MODEL_PATH = "ppo_quadhopper_precise"
     TOTAL_TIMESTEPS = 3_000_000
 
-    mode = "train_new"  # 建议使用 train_new 重新适应新的奖励函数
+    mode = "test"  # 建议使用 train_new 重新适应新的奖励函数
 
     if mode == "train_new":
         print("🚀 开始高精度训练...")
