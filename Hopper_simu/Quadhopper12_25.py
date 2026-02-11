@@ -263,7 +263,7 @@ if __name__ == '__main__':
     TOTAL_TIMESTEPS = 5_000_000
 
     # ==================== 选择模式 ====================
-    mode = "test"  # "train_new" / "continue" / "test"
+    mode = "train_new"  # "train_new" / "continue" / "test"
 
     if mode == "train_new":
         # 从零开始全新训练
