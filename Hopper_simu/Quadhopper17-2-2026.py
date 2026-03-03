@@ -32,7 +32,7 @@ class QuadhopperTargetEnv(gym.Env):
 
         # --- FIX 2: Ground Penetration ---
         # Increased significantly to make the ground stiffer and reduce penetration depth
-        self.k_spring = 1000.0  # Was 150.0
+        self.k_spring = 150.0  # Was 150.0
         # Increased damping to stabilize the stiffer spring
         self.c_damping = 20.0  # Was 1.0
 
