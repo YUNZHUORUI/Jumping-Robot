@@ -31,10 +31,18 @@ class QuadhopperTargetEnv(gym.Env):
         self.stroke_length = 0.20  # Max compression/extension stroke (m)
         self.leg_min_length = max(0.05, self.l0 - self.stroke_length)
         self.min_com_height = max(0.04, 0.35 * self.leg_min_length)
+        self.max_tilt_rad = math.radians(80.0)
         self.J = 0.15  # Inertia
         self.g = 9.81
         self.max_thrust = 30.0
         self.ground_y = 0.0
+
+        # Rendering config for small-size model
+        self.render_frame_stride = 2
+        self.render_dpi = 120
+        self.render_body_scale = 3.2
+        self.render_view_w = max(1.8, 6.0 * self.l0)
+        self.render_view_h = max(1.1, 3.6 * self.l0)
 
         # --- FIX 2: Ground Penetration ---
         # Increased significantly to make the ground stiffer and reduce penetration depth
@@ -437,7 +445,7 @@ class QuadhopperTargetEnv(gym.Env):
                 reward += 5.0 * (1.5 - dist_to_target)
 
         # 4. 终止条件 (更严的倾角限制)
-        if abs(self.q[2]) > 0.7 or self.q[1] > 7.0 or self.q[1] < self.min_com_height:
+        if abs(self.q[2]) > self.max_tilt_rad or self.q[1] > 7.0 or self.q[1] < self.min_com_height:
             terminated = True
             reward -= 100.0
 
@@ -518,13 +526,18 @@ if __name__ == '__main__':
             history['target_y'].append(traj_y)
 
             # --- Rendering GIF ---
-            if i % 3 == 0:  # Render every 3rd frame for speed
-                fig = plt.figure(figsize=(10, 5), dpi=80)
+            if i % env.render_frame_stride == 0:
+                fig = plt.figure(figsize=(9, 5.5), dpi=env.render_dpi)
                 ax = fig.add_subplot(111)
 
                 cx = obs[0]
-                ax.set_xlim(cx - 4, cx + 6)
-                ax.set_ylim(-1, 5)
+                view_w = env.render_view_w
+                view_h = env.render_view_h
+                x_left = cx - 0.65 * view_w
+                x_right = cx + 1.35 * view_w
+
+                ax.set_xlim(x_left, x_right)
+                ax.set_ylim(-0.12, view_h)
                 ax.set_aspect('equal')
                 ax.grid(True, alpha=0.3)
 
@@ -532,7 +545,7 @@ if __name__ == '__main__':
                 ax.axhline(0, color='k', lw=2)
                 for tid, tx in enumerate(env.targets):
                     color = 'g' if tid == env.current_target_idx else 'gray'
-                    ax.plot(tx, 0, 'x', color=color, markersize=10, markeredgewidth=3)
+                    ax.plot(tx, 0, 'x', color=color, markersize=8, markeredgewidth=2)
 
                 # Ideal Trajectory
                 if env.traj_valid:
@@ -552,35 +565,37 @@ if __name__ == '__main__':
                 render_foot_y = max(0.0, foot_pos[1])
 
                 # Body
+                beam_half_vis = env.beam_half_length * env.render_body_scale
                 body_x = [
-                    x - env.beam_half_length * math.cos(theta),
-                    x + env.beam_half_length * math.cos(theta)
+                    x - beam_half_vis * math.cos(theta),
+                    x + beam_half_vis * math.cos(theta)
                 ]
                 body_y = [
-                    y - env.beam_half_length * math.sin(theta),
-                    y + env.beam_half_length * math.sin(theta)
+                    y - beam_half_vis * math.sin(theta),
+                    y + beam_half_vis * math.sin(theta)
                 ]
-                ax.plot(body_x, body_y, 'k-', lw=6)
+                ax.plot(body_x, body_y, 'k-', lw=7)
 
                 # Rotors (thrust visualization)
                 thrust_l = float(np.clip(action[0], 0.0, 1.0))
                 thrust_r = float(np.clip(action[1], 0.0, 1.0))
                 rotor_l_color = plt.cm.coolwarm(thrust_l)
                 rotor_r_color = plt.cm.coolwarm(thrust_r)
-                ax.scatter(body_x[0], body_y[0], s=120, c=[rotor_l_color], edgecolors='k', linewidths=0.8, zorder=5)
-                ax.scatter(body_x[1], body_y[1], s=120, c=[rotor_r_color], edgecolors='k', linewidths=0.8, zorder=5)
+                ax.scatter(body_x[0], body_y[0], s=170, c=[rotor_l_color], edgecolors='k', linewidths=1.0, zorder=5)
+                ax.scatter(body_x[1], body_y[1], s=170, c=[rotor_r_color], edgecolors='k', linewidths=1.0, zorder=5)
 
                 # Leg
-                ax.plot([x, foot_pos[0]], [y, render_foot_y], 'b-', lw=3)
+                ax.plot([x, foot_pos[0]], [y, render_foot_y], 'b-', lw=4)
                 # Foot (Red Ball)
-                ax.plot(foot_pos[0], render_foot_y, 'ro', markersize=12)
+                ax.plot(foot_pos[0], render_foot_y, 'ro', markersize=14)
 
                 # Info text
                 ax.text(
-                    cx - 3.5,
-                    4.5,
+                    x_left + 0.04 * view_w,
+                    view_h - 0.08 * view_h,
                     f"Step: {i}\nTheta: {math.degrees(theta):.1f}°\nL thrust: {thrust_l:.2f}\nR thrust: {thrust_r:.2f}",
-                    fontsize=12
+                    fontsize=11,
+                    bbox=dict(facecolor='white', alpha=0.7, edgecolor='none')
                 )
 
                 fig.canvas.draw()
@@ -592,7 +607,7 @@ if __name__ == '__main__':
                 print(f"Episode finished at step {i}. Reason: Done={done}, Trunc={truncated}")
                 break
 
-        imageio.mimsave('quadhopper_fixed.gif', frames, fps=30)
+        imageio.mimsave('quadhopper_fixed.gif', frames, fps=25, loop=0)
         print("✅ GIF saved: quadhopper_fixed.gif")
 
         # ==================== Analysis Plots ====================
