@@ -36,6 +36,10 @@ class QuadhopperTargetEnv(gym.Env):
         self.max_thrust = 30.0
         self.ground_y = 0.0
 
+        # ==================== Rendering Scale Factor ====================
+        # 为了在渲染时放大机身，使其更容易观测（不影响物理计算）
+        self.render_scale = 10.0  # 渲染时放大5倍
+
         # --- FIX 2: Ground Penetration ---
         # Increased significantly to make the ground stiffer and reduce penetration depth
         self.k_spring = 150.0  # Was 150.0
@@ -421,7 +425,7 @@ class QuadhopperTargetEnv(gym.Env):
         reward -= 0.08 * abs(self.q[2])
         reward -= 0.1 * abs(self.dq[2])  # 旋转角速度惩罚加大，防止一直转
 
-        # 3. 落地与判定逻辑
+        # 3. 落地与判定逻辑``
         if touching and self.dq[1] > -0.5 and target_valid:
             if dist_to_target < self.target_tolerance:
                 reward += 150.0
@@ -519,11 +523,13 @@ if __name__ == '__main__':
 
             # --- Rendering GIF ---
             if i % 3 == 0:  # Render every 3rd frame for speed
-                fig = plt.figure(figsize=(10, 5), dpi=80)
+                fig = plt.figure(figsize=(12, 6), dpi=80)
                 ax = fig.add_subplot(111)
 
                 cx = obs[0]
-                ax.set_xlim(cx - 4, cx + 6)
+                # 应用渲染缩放因子：只缩放坐标，不缩放轴范围
+                s = env.render_scale
+                ax.set_xlim((cx - 4), (cx + 6))
                 ax.set_ylim(-1, 5)
                 ax.set_aspect('equal')
                 ax.grid(True, alpha=0.3)
@@ -551,7 +557,7 @@ if __name__ == '__main__':
                 # even if physics penetration is slightly non-zero.
                 render_foot_y = max(0.0, foot_pos[1])
 
-                # Body
+                # Body (scale line width instead of coordinates)
                 body_x = [
                     x - env.beam_half_length * math.cos(theta),
                     x + env.beam_half_length * math.cos(theta)
@@ -560,20 +566,20 @@ if __name__ == '__main__':
                     y - env.beam_half_length * math.sin(theta),
                     y + env.beam_half_length * math.sin(theta)
                 ]
-                ax.plot(body_x, body_y, 'k-', lw=6)
+                ax.plot(body_x, body_y, 'k-', lw=6*s)
 
                 # Rotors (thrust visualization)
                 thrust_l = float(np.clip(action[0], 0.0, 1.0))
                 thrust_r = float(np.clip(action[1], 0.0, 1.0))
                 rotor_l_color = plt.cm.coolwarm(thrust_l)
                 rotor_r_color = plt.cm.coolwarm(thrust_r)
-                ax.scatter(body_x[0], body_y[0], s=120, c=[rotor_l_color], edgecolors='k', linewidths=0.8, zorder=5)
-                ax.scatter(body_x[1], body_y[1], s=120, c=[rotor_r_color], edgecolors='k', linewidths=0.8, zorder=5)
+                ax.scatter(body_x[0], body_y[0], s=200*s, c=[rotor_l_color], edgecolors='k', linewidths=0.8, zorder=5)
+                ax.scatter(body_x[1], body_y[1], s=200*s, c=[rotor_r_color], edgecolors='k', linewidths=0.8, zorder=5)
 
-                # Leg
-                ax.plot([x, foot_pos[0]], [y, render_foot_y], 'b-', lw=3)
+                # Leg (scale line width instead of coordinates)
+                ax.plot([x, foot_pos[0]], [y, render_foot_y], 'b-', lw=3*s)
                 # Foot (Red Ball)
-                ax.plot(foot_pos[0], render_foot_y, 'ro', markersize=12)
+                ax.plot(foot_pos[0], render_foot_y, 'ro', markersize=12*s)
 
                 # Info text
                 ax.text(
