@@ -30,10 +30,10 @@ def main():
     # 1. 加载环境与模型
     env = DummyVecEnv([lambda: PogoDroneEnv()])
     try:
-        env = VecNormalize.load("/Users/terry/Jumping-Robot/model-free-mujoco-RL/Quadhopper-stable velocity/vec_normalize_natural.pkl", env)
+        env = VecNormalize.load("/Users/yunzhuorui/Jumping-Robot/model-free-mujoco-RL/Quadhopper-stable velocity/vec_normalize_natural.pkl", env)
         env.training = False
         env.norm_reward = False
-        model = PPO.load("/Users/terry/Jumping-Robot/model-free-mujoco-RL/Quadhopper-stable velocity/pogo_natural_final.zip", env=env)
+        model = PPO.load("/Users/yunzhuorui/Jumping-Robot/model-free-mujoco-RL/Quadhopper-stable velocity/pogo_natural_final.zip", env=env)
     except Exception as e:
         print(f"❌ 错误: 无法加载模型 ({e})")
         return

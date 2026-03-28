@@ -10,10 +10,10 @@ class PogoDroneEnv(gym.Env):
     def __init__(self, render_mode=None):
         super().__init__()
 
-        if not os.path.exists("/Users/terry/Jumping-Robot/model-free-mujoco-RL/Quadhopper-stable velocity/scene.xml"):
+        if not os.path.exists("/Users/yunzhuorui/Jumping-Robot/model-free-mujoco-RL/Quadhopper-stable velocity/scene.xml"):
             raise FileNotFoundError("❌ 找不到 scene.xml")
 
-        self.model = mujoco.MjModel.from_xml_path("/Users/terry/Jumping-Robot/model-free-mujoco-RL/Quadhopper-stable velocity/scene.xml")
+        self.model = mujoco.MjModel.from_xml_path("/Users/yunzhuorui/Jumping-Robot/model-free-mujoco-RL/Quadhopper-stable velocity/scene.xml")
         self.data = mujoco.MjData(self.model)
 
         self.drone_id = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_BODY, "quadcopter")
