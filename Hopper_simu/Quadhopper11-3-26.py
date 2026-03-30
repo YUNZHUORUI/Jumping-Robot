@@ -22,7 +22,7 @@ class QuadhopperTargetEnv(gym.Env):
 
         # ==================== 1. Physics Parameters (FIXED) ====================
         self.dt = 0.002
-        self.m = 1.21
+        self.m = 0.213 #kg
         self.rotor_span = 0.10  # Distance between two rotors (m)
         self.beam_half_length = 0.5 * self.rotor_span
         self.lc = self.beam_half_length  # CG to each rotor (torque arm)
@@ -37,8 +37,9 @@ class QuadhopperTargetEnv(gym.Env):
         self.ground_y = 0.0
 
         # ==================== Rendering Scale Factor ====================
-        # 为了在渲染时放大机身，使其更容易观测（不影响物理计算）
-        self.render_scale = 10.0  # 渲染时放大5倍
+        # 仅用于可视化，不影响物理计算
+        self.render_geom_scale = 2.5
+        self.render_rotor_size = 55.0
 
         # --- FIX 2: Ground Penetration ---
         # Increased significantly to make the ground stiffer and reduce penetration depth
@@ -79,6 +80,7 @@ class QuadhopperTargetEnv(gym.Env):
         self.traj_b_local = 0.0
         self.traj_x0 = 0.0
         self.traj_y0 = 0.0
+        self.traj_vx_nom = 0.0
         self.traj_valid = False
 
         # Randomized launch state for robustness (instead of perfect ballistic init)
@@ -202,6 +204,8 @@ class QuadhopperTargetEnv(gym.Env):
         self.traj_b_local = tan_a
         self.traj_x0 = x_curr
         self.traj_y0 = y_curr
+        v0 = math.sqrt(max(v0_sq, 1e-6))
+        self.traj_vx_nom = max(0.2, v0 * cos_a)
         self.traj_valid = True
 
     def get_trajectory_state(self, x_current):
@@ -220,9 +224,9 @@ class QuadhopperTargetEnv(gym.Env):
         slope_ideal = 2 * self.traj_a * dx + self.traj_b_local
 
         # 3. Ideal vertical velocity (dy/dt) = (dy/dx) * (dx/dt)
-        # Use current horizontal velocity to scale vertical velocity requirement
-        current_vx = max(0.1, self.dq[0])
-        dy_ideal = slope_ideal * current_vx
+        # Use planned nominal vx (instead of current vx) to avoid policy exploiting high-speed jumps
+        vx_ref = self.traj_vx_nom if self.traj_vx_nom > 0.0 else max(0.1, self.dq[0])
+        dy_ideal = slope_ideal * vx_ref
 
         return y_ideal, dy_ideal
 
@@ -377,7 +381,8 @@ class QuadhopperTargetEnv(gym.Env):
 
         foot_pos = self.get_foot_pos()
         target_valid = self.current_target_idx < len(self.targets)
-        dist_to_target = abs(foot_pos[0] - self.targets[self.current_target_idx]) if target_valid else 0.0
+        target_x = self.targets[self.current_target_idx] if target_valid else foot_pos[0]
+        dist_to_target = abs(foot_pos[0] - target_x) if target_valid else 0.0
         touchdown_event = touching and (not self.prev_touching)
         liftoff_event = (not touching) and self.prev_touching
 
@@ -386,12 +391,23 @@ class QuadhopperTargetEnv(gym.Env):
             y_ideal, dy_ideal = self.get_trajectory_state(self.q[0])
             error_y = abs(self.q[1] - y_ideal)
 
-            # 跟踪奖励：放宽指数惩罚，让它更容易学
-            reward += 1.0 * math.exp(-5.0 * error_y)
+            # 跟踪奖励：强化抛物线高度跟踪
+            reward += 1.8 * math.exp(-8.0 * error_y)
+
+            # 强化 target 接近度，抑制“跳很远”投机策略
+            if target_valid:
+                reward += 2.0 * math.exp(-1.6 * dist_to_target)
+                overshoot = foot_pos[0] - target_x
+                if overshoot > 0.0:
+                    reward -= 2.5 * overshoot
 
             # 关键修复：空中推力惩罚！
             # 抛物线是重力主导的，在空中开电机会改变弹道并带来力矩。鼓励空中“滑翔”。
-            reward -= 0.05 * (u1 + u2)
+            reward -= 0.08 * (u1 + u2)
+
+            # 水平速度约束：贴近轨迹规划速度，避免一味冲刺
+            if self.traj_vx_nom > 0.0:
+                reward -= 0.12 * abs(self.dq[0] - self.traj_vx_nom)
 
             # Flight attitude tracking for negative-angle touchdown
             theta_err_land = abs(self._wrap_angle(self.q[2] - self.landing_theta_target))
@@ -400,7 +416,7 @@ class QuadhopperTargetEnv(gym.Env):
 
             # First target shaping: reduce large miss distance at the first jump.
             if target_valid and self.current_target_idx == 0:
-                reward += 1.0 * math.exp(-0.9 * dist_to_target)
+                reward += 2.0 * math.exp(-1.2 * dist_to_target)
 
         # Touchdown attitude constraint (must land with negative tilt)
         if touchdown_event:
@@ -438,7 +454,7 @@ class QuadhopperTargetEnv(gym.Env):
                 else:
                     self._plan_trajectory()
             elif dist_to_target < 1.5:
-                reward += 5.0 * (1.5 - dist_to_target)
+                reward += 10.0 * (1.5 - dist_to_target)
 
         # 4. 终止条件 (更严的倾角限制)
         if abs(self.q[2]) > 0.7 or self.q[1] > 7.0 or self.q[1] < self.min_com_height:
@@ -447,10 +463,10 @@ class QuadhopperTargetEnv(gym.Env):
 
         if self.q[0] < -1.0 or (
             self.current_target_idx < len(self.targets)
-            and foot_pos[0] > self.targets[self.current_target_idx] + 3.0
+            and foot_pos[0] > self.targets[self.current_target_idx] + 1.0
         ):
             terminated = True
-            reward -= 50.0
+            reward -= 90.0
 
         self.steps += 1
         self.prev_touching = touching
@@ -527,10 +543,9 @@ if __name__ == '__main__':
                 ax = fig.add_subplot(111)
 
                 cx = obs[0]
-                # 应用渲染缩放因子：只缩放坐标，不缩放轴范围
-                s = env.render_scale
-                ax.set_xlim((cx - 4), (cx + 6))
-                ax.set_ylim(-1, 5)
+                # 收紧视窗，保证机身细节可见
+                ax.set_xlim((cx - 2.0), (cx + 3.0))
+                ax.set_ylim(-0.2, 2.8)
                 ax.set_aspect('equal')
                 ax.grid(True, alpha=0.3)
 
@@ -552,34 +567,42 @@ if __name__ == '__main__':
                 x, y, theta = obs[0], obs[1], obs[2]
                 foot_pos = env.get_foot_pos()
 
-                # --- FIX 2b: Cosmetic Render Clamp ---
-                # Visually ensure the ball doesn't look like it's underground,
-                # even if physics penetration is slightly non-zero.
-                render_foot_y = max(0.0, foot_pos[1])
+                # --- FIX: 保持渲染几何与比例一致 ---
+                # 统一几何缩放：机架长度和腿长度使用同一个比例因子
+                # 因此始终满足 leg:frame = l0:rotor_span = 0.3:0.1 = 3:1
+                render_scale = env.render_geom_scale
+                com = np.array([x, y], dtype=np.float64)
 
-                # Body (scale line width instead of coordinates)
-                body_x = [
-                    x - env.beam_half_length * math.cos(theta),
-                    x + env.beam_half_length * math.cos(theta)
-                ]
-                body_y = [
-                    y - env.beam_half_length * math.sin(theta),
-                    y + env.beam_half_length * math.sin(theta)
-                ]
-                ax.plot(body_x, body_y, 'k-', lw=6*s)
+                leg_vec = np.array(foot_pos, dtype=np.float64) - com
+                leg_len = float(np.linalg.norm(leg_vec))
+                if leg_len > 1e-8:
+                    leg_dir = leg_vec / leg_len
+                else:
+                    # 退化兜底：若腿长过小，使用姿态角推导腿方向
+                    leg_dir = np.array([math.sin(theta), -math.cos(theta)], dtype=np.float64)
+
+                leg_vec_render = leg_vec * render_scale
+                render_foot = com + leg_vec_render
+
+                body_dir = np.array([leg_dir[1], -leg_dir[0]], dtype=np.float64)
+                body_half_render = env.beam_half_length * render_scale
+
+                body_l = com - body_half_render * body_dir
+                body_r = com + body_half_render * body_dir
+                ax.plot([body_l[0], body_r[0]], [body_l[1], body_r[1]], 'k-', lw=4.0)
 
                 # Rotors (thrust visualization)
                 thrust_l = float(np.clip(action[0], 0.0, 1.0))
                 thrust_r = float(np.clip(action[1], 0.0, 1.0))
                 rotor_l_color = plt.cm.coolwarm(thrust_l)
                 rotor_r_color = plt.cm.coolwarm(thrust_r)
-                ax.scatter(body_x[0], body_y[0], s=200*s, c=[rotor_l_color], edgecolors='k', linewidths=0.8, zorder=5)
-                ax.scatter(body_x[1], body_y[1], s=200*s, c=[rotor_r_color], edgecolors='k', linewidths=0.8, zorder=5)
+                ax.scatter(body_l[0], body_l[1], s=env.render_rotor_size, c=[rotor_l_color], edgecolors='k', linewidths=0.8, zorder=5)
+                ax.scatter(body_r[0], body_r[1], s=env.render_rotor_size, c=[rotor_r_color], edgecolors='k', linewidths=0.8, zorder=5)
 
-                # Leg (scale line width instead of coordinates)
-                ax.plot([x, foot_pos[0]], [y, render_foot_y], 'b-', lw=3*s)
+                # Leg（真实几何，不再额外拉伸）
+                ax.plot([x, render_foot[0]], [y, render_foot[1]], 'b-', lw=2.6)
                 # Foot (Red Ball)
-                ax.plot(foot_pos[0], render_foot_y, 'ro', markersize=12*s)
+                ax.plot(render_foot[0], render_foot[1], 'ro', markersize=9)
 
                 # Info text
                 ax.text(

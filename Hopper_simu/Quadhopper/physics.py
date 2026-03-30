@@ -1,22 +1,13 @@
-# quadhopper/physics.py
-"""
-Low-level physics simulation for the QuadHopper robot.
-Handles SLIP stance model, spring-damper ground contact,
-and symplectic Euler integration.
-"""
+"""Low-level physics simulation for QuadHopper."""
+
 import math
 import numpy as np
+
 from .config import PhysicsConfig, AttitudeConfig
 
 
 class PhysicsEngine:
-    """
-    Encapsulates all physics computation for a single simulation step.
-
-    State convention:
-        q  = [x, y, theta, l]    (position-like)
-        dq = [dx, dy, dtheta, dl] (velocity-like)
-    """
+    """Encapsulates single-step dynamics for q=[x,y,theta,l], dq=[dx,dy,dtheta,dl]."""
 
     def __init__(self, physics_cfg: PhysicsConfig, attitude_cfg: AttitudeConfig):
         self.cfg = physics_cfg
@@ -66,7 +57,13 @@ class PhysicsEngine:
 
     # ---------------------------------------------------------------- SLIP step
     def _compute_slip_forces(
-        self, q: np.ndarray, dq: np.ndarray, F_total: float
+        self,
+        q: np.ndarray,
+        dq: np.ndarray,
+        F_total: float,
+        landing_theta_target: float,
+        takeoff_theta_target: float,
+        takeoff_theta_tol: float,
     ):
         """
         Compute contact forces using the SLIP model.
@@ -80,8 +77,15 @@ class PhysicsEngine:
         foot_y_virt = y - self.cfg.leg_length * c
         foot_x_virt = x + self.cfg.leg_length * s
 
-        # Touchdown detection
+        # Touchdown detection with landing-attitude clamp
         if (not self.stance_active) and (foot_y_virt <= self.cfg.ground_y):
+            theta_td = min(theta, landing_theta_target)
+            q[2] = theta_td
+            dq[2] = 0.0
+            theta = theta_td
+            s, c = math.sin(theta), math.cos(theta)
+            foot_x_virt = x + self.cfg.leg_length * s
+
             self.stance_active = True
             self.stance_foot_anchor = np.array(
                 [foot_x_virt, self.cfg.ground_y], dtype=np.float64
@@ -107,7 +111,7 @@ class PhysicsEngine:
             F_act_x = F_total * e_x
             F_act_y = F_total * e_y
 
-            compression = self.cfg.leg_length - l_curr
+            compression = float(np.clip(self.cfg.leg_length - l_curr, 0.0, self.cfg.stroke_length))
             if compression > 0.0:
                 F_mag = self.cfg.k_slip * compression - self.cfg.c_slip * dl
                 F_mag = max(0.0, F_mag)
@@ -116,11 +120,10 @@ class PhysicsEngine:
 
             # Liftoff condition
             theta_leg = math.atan2(-r_x, r_y)
-            reached_takeoff = theta_leg >= self.att.takeoff_theta_min
-            over_extended = l_curr >= 1.04 * self.cfg.leg_length
-            natural_liftoff = (
-                l_curr >= self.cfg.leg_length and dl > 0.0 and reached_takeoff
-            )
+            theta_err_takeoff = abs(self.wrap_angle(theta_leg - takeoff_theta_target))
+            reached_takeoff = theta_err_takeoff <= takeoff_theta_tol
+            over_extended = l_curr >= self.cfg.leg_length + 0.05 * self.cfg.stroke_length
+            natural_liftoff = (l_curr >= self.cfg.leg_length) and (dl > 0.0) and reached_takeoff
             if natural_liftoff or over_extended:
                 self.stance_active = False
 
@@ -146,7 +149,7 @@ class PhysicsEngine:
         if foot_y_virt < self.cfg.ground_y:
             touching = True
             l_curr = y / max(abs(c), 0.01)
-            compression = self.cfg.leg_length - l_curr
+            compression = float(np.clip(self.cfg.leg_length - l_curr, 0.0, self.cfg.stroke_length))
             if compression > 0:
                 comp_rate = -(dx * s - dy * c)
                 F_mag = (
@@ -165,7 +168,9 @@ class PhysicsEngine:
         q: np.ndarray,
         dq: np.ndarray,
         action: np.ndarray,
+        landing_theta_target: float,
         takeoff_theta_target: float,
+        takeoff_theta_tol: float,
     ):
         """
         Advance physics by one timestep dt using Symplectic Euler integration.
@@ -190,7 +195,14 @@ class PhysicsEngine:
         # Compute contact forces
         if self.cfg.use_slip_stance:
             F_act_x, F_act_y, F_sx, F_sy, touching, l_curr, dl = (
-                self._compute_slip_forces(q, dq, F_total)
+                self._compute_slip_forces(
+                    q,
+                    dq,
+                    F_total,
+                    landing_theta_target,
+                    takeoff_theta_target,
+                    takeoff_theta_tol,
+                )
             )
         else:
             F_act_x, F_act_y, F_sx, F_sy, touching, l_curr, dl = (
@@ -216,10 +228,10 @@ class PhysicsEngine:
 
         # Update leg state in q/dq
         if self.stance_active:
-            q[3]  = l_curr
+            q[3] = l_curr
             dq[3] = dl
         else:
-            q[3]  = self.cfg.leg_length
+            q[3] = self.cfg.leg_length
             dq[3] = 0.0
 
         return touching

@@ -1,44 +1,46 @@
-# quadhopper/trajectory.py
-"""
-Parabolic trajectory planner for QuadHopper.
+"""Parabolic trajectory planner for QuadHopper."""
 
-Computes ideal ballistic arc from current COM position to
-target foot contact point and provides real-time tracking state.
-"""
 import math
 import numpy as np
-from .config import PhysicsConfig, EnvConfig
+
+from .config import AttitudeConfig, EnvConfig, PhysicsConfig
 
 
 class TrajectoryPlanner:
-    """
-    Plans and evaluates a parabolic (ballistic) trajectory.
+    """Plans and evaluates a ballistic trajectory from current state to target."""
 
-    Trajectory model:
-        y(x) = a*(x - x0)^2 + b*(x - x0) + y0
-    """
-
-    def __init__(self, physics_cfg: PhysicsConfig, env_cfg: EnvConfig):
+    def __init__(
+        self,
+        physics_cfg: PhysicsConfig,
+        env_cfg: EnvConfig,
+        attitude_cfg: AttitudeConfig,
+    ):
         self.physics = physics_cfg
         self.env = env_cfg
+        self.att = attitude_cfg
 
-        # Planned trajectory coefficients
         self.a: float = 0.0
-        self.b_local: float = 0.0   # slope at launch
+        self.b_local: float = 0.0
         self.x0: float = 0.0
         self.y0: float = 0.0
+        self.vx_nom: float = 0.0
+        self.vy_nom: float = 0.0
+        self.v0_min: float = 0.0
+        self.theta_opt: float = 0.0
         self.valid: bool = False
-        self.takeoff_theta_target: float = math.radians(
-            env_cfg.traj_tilt_min_deg
-        )
+        self.takeoff_theta_target: float = attitude_cfg.takeoff_theta
 
     def reset(self):
-        """Clear current trajectory."""
         self.valid = False
         self.a = 0.0
         self.b_local = 0.0
         self.x0 = 0.0
         self.y0 = 0.0
+        self.vx_nom = 0.0
+        self.vy_nom = 0.0
+        self.v0_min = 0.0
+        self.theta_opt = 0.0
+        self.takeoff_theta_target = self.att.takeoff_theta
 
     def plan(
         self,
@@ -47,95 +49,57 @@ class TrajectoryPlanner:
         target_x_foot: float,
         rng: np.random.Generator = None,
     ) -> bool:
-        """
-        Plan a parabolic trajectory from (x_curr, y_curr) to target_x_foot.
-
-        Args:
-            x_curr:       Current COM x position.
-            y_curr:       Current COM y position.
-            target_x_foot: Foot target x position on the ground.
-            rng:          Optional numpy RNG for reproducibility.
-
-        Returns:
-            True if planning succeeded, False otherwise.
-        """
         estimated_land_theta = math.radians(-15.0)
         offset_x = self.physics.leg_length * math.sin(estimated_land_theta)
         x_target_com = target_x_foot - offset_x
 
         dx = x_target_com - x_curr
-        dy = (
-            self.physics.leg_length * math.cos(estimated_land_theta) - y_curr
-        )
+        dy = self.physics.leg_length * math.cos(estimated_land_theta) - y_curr
 
         if dx <= 0.3:
             self.valid = False
             return False
 
-        # Random launch angle
-        if rng is not None:
-            tilt_deg = rng.uniform(
-                self.env.traj_tilt_min_deg, self.env.traj_tilt_max_deg
-            )
-        else:
-            tilt_deg = np.random.uniform(
-                self.env.traj_tilt_min_deg, self.env.traj_tilt_max_deg
-            )
+        # Minimum-energy ballistic solution:
+        # theta_opt = atan((z + sqrt(x^2 + z^2)) / x)
+        # v_min^2   = g * (z + sqrt(x^2 + z^2))
+        r = math.sqrt(dx * dx + dy * dy)
+        theta_opt = math.atan2(dy + r, dx)
+        v_min_sq = self.physics.gravity * (dy + r)
+        if v_min_sq <= 1e-8:
+            self.valid = False
+            return False
 
-        launch_alpha = math.radians(90.0 - tilt_deg)
-        self.takeoff_theta_target = math.radians(tilt_deg)
+        v_min = math.sqrt(v_min_sq)
+        vx_nom = max(0.2, v_min * math.cos(theta_opt))
+        vy_nom = v_min * math.sin(theta_opt)
 
-        tan_a = math.tan(launch_alpha)
-        cos_a = math.cos(launch_alpha)
+        self.a = -self.physics.gravity / (2.0 * vx_nom * vx_nom)
+        self.b_local = vy_nom / vx_nom
+        self.x0 = x_curr
+        self.y0 = y_curr
+        self.vx_nom = vx_nom
+        self.vy_nom = vy_nom
+        self.v0_min = v_min
+        self.theta_opt = theta_opt
 
-        denominator = dx * tan_a - dy
-        if denominator <= 0.01:
-            # Fallback to steeper angle
-            launch_alpha = math.radians(75.0)
-            tan_a  = math.tan(launch_alpha)
-            cos_a  = math.cos(launch_alpha)
-            denominator = max(dx * tan_a - dy, 0.001)
-
-        v0_sq = (self.physics.gravity * dx ** 2) / (
-            2.0 * (cos_a ** 2) * denominator
-        )
-
-        self.a       = -self.physics.gravity / (2.0 * v0_sq * cos_a ** 2)
-        self.b_local = tan_a
-        self.x0      = x_curr
-        self.y0      = y_curr
-        self.valid   = True
+        # Keep compatibility with stance attitude control convention
+        self.takeoff_theta_target = (math.pi / 2.0) - theta_opt
+        self.valid = True
         return True
 
     def get_initial_velocity(self):
-        """
-        Compute the initial COM velocity that follows the planned trajectory.
-
-        Returns:
-            (v_x0, v_y0) tuple, or (3.0, 4.0) fallback if not valid.
-        """
         if not self.valid:
             return 3.0, 4.0
-        v_x0 = math.sqrt(-self.physics.gravity / (2.0 * self.a))
-        v_y0 = self.b_local * v_x0
-        return v_x0, v_y0
+        return self.vx_nom, self.vy_nom
 
     def get_state(self, x_current: float, v_x: float = 1.0):
-        """
-        Query the ideal height and vertical velocity at x_current.
-
-        Args:
-            x_current: Current x position of COM.
-            v_x:       Current horizontal velocity (used to scale dy/dt).
-
-        Returns:
-            (y_ideal, dy_ideal)
-        """
         if not self.valid:
             return 1.1, 0.0
 
         dx = max(x_current - self.x0, 0.0)
-        y_ideal    = self.a * dx ** 2 + self.b_local * dx + self.y0
-        slope      = 2.0 * self.a * dx + self.b_local
-        dy_ideal   = slope * max(v_x, 0.1)
+        y_ideal = self.a * dx ** 2 + self.b_local * dx + self.y0
+        slope = 2.0 * self.a * dx + self.b_local
+        vx_ref = self.vx_nom if self.vx_nom > 0.0 else max(v_x, 0.1)
+        dy_ideal = slope * vx_ref
         return y_ideal, dy_ideal

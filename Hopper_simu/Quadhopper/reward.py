@@ -1,10 +1,5 @@
-# quadhopper/reward.py
-"""
-Reward function for QuadHopper.
+"""Reward function for QuadHopper."""
 
-Separated from the environment to make reward shaping
-easy to modify, log, and unit-test independently.
-"""
 import math
 from dataclasses import dataclass
 from typing import Tuple
@@ -15,16 +10,21 @@ from .config import RewardConfig
 @dataclass
 class RewardInfo:
     """Breakdown of reward components for logging/debugging."""
-    flight_track:    float = 0.0
+    flight_track: float = 0.0
+    flight_dy_track: float = 0.0
+    flight_target: float = 0.0
+    flight_overshoot: float = 0.0
+    flight_vx_track: float = 0.0
     flight_attitude: float = 0.0
-    flight_thrust:   float = 0.0
-    flight_ang_vel:  float = 0.0
-    touchdown:       float = 0.0
+    flight_thrust: float = 0.0
+    flight_ang_vel: float = 0.0
+    first_target: float = 0.0
+    touchdown: float = 0.0
     stance_attitude: float = 0.0
-    liftoff:         float = 0.0
-    attitude_pen:    float = 0.0
-    target_hit:      float = 0.0
-    termination:     float = 0.0
+    liftoff: float = 0.0
+    attitude_pen: float = 0.0
+    target_hit: float = 0.0
+    termination: float = 0.0
 
     @property
     def total(self) -> float:
@@ -32,9 +32,7 @@ class RewardInfo:
 
 
 class RewardFunction:
-    """
-    Stateless reward function — receives environment state and returns reward.
-    """
+    """Stateless reward function with explicit component breakdown."""
 
     def __init__(self, cfg: RewardConfig):
         self.cfg = cfg
@@ -47,9 +45,9 @@ class RewardFunction:
         self,
         *,
         # Kinematic state
-        theta: float,       # body tilt (rad)
-        dtheta: float,      # angular velocity
-        com_y: float,       # COM height
+        theta: float,
+        dtheta: float,
+        vx: float,
         # Contact events
         touching: bool,
         touchdown_event: bool,
@@ -57,8 +55,8 @@ class RewardFunction:
         # Trajectory tracking
         traj_valid: bool,
         y_error: float,
-        y_ideal: float,
-        dy_ideal: float,
+        dy_error: float,
+        traj_vx_nom: float,
         # Attitude targets
         landing_theta_target: float,
         takeoff_theta_target: float,
@@ -67,7 +65,10 @@ class RewardFunction:
         u2: float,
         # Target geometry
         dist_to_target: float,
+        target_x: float,
+        foot_x: float,
         target_valid: bool,
+        current_target_idx: int,
         # Target success flag (set externally)
         target_hit: bool = False,
         all_targets_done: bool = False,
@@ -85,11 +86,26 @@ class RewardFunction:
         info = RewardInfo()
 
         # ── 1. Flight phase ────────────────────────────────────────────────
-        if not touching and traj_valid:
+        if (not touching) and traj_valid:
             info.flight_track = c.flight_traj_track_weight * math.exp(
                 -c.flight_traj_track_sharpness * abs(y_error)
             )
+            info.flight_dy_track = c.flight_dy_track_weight * math.exp(
+                -c.flight_dy_track_sharpness * abs(dy_error)
+            )
+
+            if target_valid:
+                info.flight_target = c.flight_target_weight * math.exp(
+                    -c.flight_target_sharpness * dist_to_target
+                )
+                overshoot = foot_x - target_x
+                if overshoot > 0.0:
+                    info.flight_overshoot = -c.flight_overshoot_penalty * overshoot
+
             info.flight_thrust = -c.flight_thrust_penalty * (u1 + u2)
+
+            if traj_vx_nom > 0.0:
+                info.flight_vx_track = -c.flight_vx_track_penalty * abs(vx - traj_vx_nom)
 
             theta_err_land = abs(
                 self._wrap_angle(theta - landing_theta_target)
@@ -98,6 +114,11 @@ class RewardFunction:
                 -c.flight_attitude_sharpness * theta_err_land
             )
             info.flight_ang_vel = -c.flight_angular_vel_penalty * abs(dtheta)
+
+            if target_valid and current_target_idx == 0:
+                info.first_target = c.first_target_weight * math.exp(
+                    -c.first_target_sharpness * dist_to_target
+                )
 
         # ── 2. Touchdown event ─────────────────────────────────────────────
         if touchdown_event:

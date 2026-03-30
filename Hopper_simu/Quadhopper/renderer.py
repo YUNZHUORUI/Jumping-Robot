@@ -1,7 +1,5 @@
-# quadhopper/renderer.py
-"""
-Visualization and GIF rendering utilities for QuadHopper.
-"""
+"""Visualization and GIF rendering utilities for QuadHopper."""
+
 import math
 import numpy as np
 import matplotlib
@@ -27,6 +25,7 @@ class QuadhopperRenderer:
         step: int,
         obs: np.ndarray,
         env,              # QuadhopperTargetEnv instance
+        action: np.ndarray = None,
     ):
         """
         Render one frame if `step % render_every_n == 0`.
@@ -72,19 +71,40 @@ class QuadhopperRenderer:
 
         # Robot body & leg
         x, y, theta = obs[0], obs[1], obs[2]
-        foot_pos     = env.get_foot_pos()
-        render_foot_y = max(0.0, foot_pos[1])  # cosmetic clamp
+        foot_pos = env.get_foot_pos()
 
-        body_x = [x - 0.2 * math.cos(theta), x + 0.2 * math.cos(theta)]
-        body_y = [y - 0.2 * math.sin(theta), y + 0.2 * math.sin(theta)]
-        ax.plot(body_x, body_y, 'k-', lw=6)
-        ax.plot([x, foot_pos[0]], [y, render_foot_y], 'b-', lw=3)
-        ax.plot(foot_pos[0], render_foot_y, 'ro', markersize=12)
+        render_scale = cfg.render_geom_scale
+        com = np.array([x, y], dtype=np.float64)
+        leg_vec = np.array(foot_pos, dtype=np.float64) - com
+        leg_len = float(np.linalg.norm(leg_vec))
+        if leg_len > 1e-8:
+            leg_dir = leg_vec / leg_len
+        else:
+            leg_dir = np.array([math.sin(theta), -math.cos(theta)], dtype=np.float64)
+
+        leg_vec_render = leg_vec * render_scale
+        render_foot = com + leg_vec_render
+
+        body_dir = np.array([leg_dir[1], -leg_dir[0]], dtype=np.float64)
+        body_half_render = env.pcfg.beam_half_length * render_scale
+        body_l = com - body_half_render * body_dir
+        body_r = com + body_half_render * body_dir
+        ax.plot([body_l[0], body_r[0]], [body_l[1], body_r[1]], 'k-', lw=cfg.body_linewidth)
+
+        thrust_l = 0.0 if action is None else float(np.clip(action[0], 0.0, 1.0))
+        thrust_r = 0.0 if action is None else float(np.clip(action[1], 0.0, 1.0))
+        rotor_l_color = plt.cm.coolwarm(thrust_l)
+        rotor_r_color = plt.cm.coolwarm(thrust_r)
+        ax.scatter(body_l[0], body_l[1], s=cfg.render_rotor_size, c=[rotor_l_color], edgecolors='k', linewidths=0.8, zorder=5)
+        ax.scatter(body_r[0], body_r[1], s=cfg.render_rotor_size, c=[rotor_r_color], edgecolors='k', linewidths=0.8, zorder=5)
+
+        ax.plot([x, render_foot[0]], [y, render_foot[1]], 'b-', lw=cfg.leg_linewidth)
+        ax.plot(render_foot[0], render_foot[1], 'ro', markersize=cfg.foot_markersize)
 
         ax.text(
             cx - cfg.view_x_behind + 0.5,
             cfg.view_y_max - 0.5,
-            f"Step: {step}  Theta: {math.degrees(theta):.1f} deg",
+            f"Step: {step}  Theta: {math.degrees(theta):.1f} deg\nL: {thrust_l:.2f} R: {thrust_r:.2f}",
             fontsize=12,
         )
 

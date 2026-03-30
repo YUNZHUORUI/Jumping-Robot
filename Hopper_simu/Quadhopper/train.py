@@ -10,15 +10,27 @@ Usage:
 import math
 import os
 import argparse
+import sys
+from pathlib import Path
 from multiprocessing import freeze_support
 
 from stable_baselines3 import PPO
 from stable_baselines3.common.vec_env import SubprocVecEnv
 from stable_baselines3.common.env_util import make_vec_env
 
-from .config import TRAINING, RENDER
-from .env import QuadhopperTargetEnv
-from .renderer import QuadhopperRenderer
+try:
+    # Preferred: package execution, e.g. `python -m Quadhopper.train`
+    from .config import TRAINING, RENDER
+    from .env import QuadhopperTargetEnv
+except ImportError:
+    # Fallback: direct script execution in IDEs (PyCharm runfile)
+    this_dir = Path(__file__).resolve().parent
+    package_parent = this_dir.parent
+    if str(package_parent) not in sys.path:
+        sys.path.insert(0, str(package_parent))
+
+    from Quadhopper.config import TRAINING, RENDER
+    from Quadhopper.env import QuadhopperTargetEnv
 
 
 def train(cfg=TRAINING):
@@ -51,6 +63,11 @@ def train(cfg=TRAINING):
 
 def test(model_path=TRAINING.model_path, render_cfg=RENDER):
     """Run one test episode and produce GIF + analysis plots."""
+    try:
+        from .renderer import QuadhopperRenderer
+    except ImportError:
+        from Quadhopper.renderer import QuadhopperRenderer
+
     print(f"Testing model: {model_path}")
 
     if os.path.exists(model_path + ".zip"):
@@ -82,7 +99,7 @@ def test(model_path=TRAINING.model_path, render_cfg=RENDER):
         traj_y, _ = env.get_trajectory_state(float(obs[0]))
         history['target_y'].append(traj_y)
 
-        renderer.maybe_render_frame(i, obs, env)
+        renderer.maybe_render_frame(i, obs, env, action=action)
 
         if done or truncated:
             print(
@@ -116,3 +133,4 @@ def main():
 if __name__ == "__main__":
     freeze_support()
     main()
+
