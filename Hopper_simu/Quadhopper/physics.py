@@ -55,6 +55,16 @@ class PhysicsEngine:
         theta = math.atan2(-r_x, r_y)
         return theta, l_curr
 
+    def _project_no_slip_velocity(self, q: np.ndarray, dq: np.ndarray):
+        """Project COM velocity so foot contact velocity is zero under stance."""
+        theta = float(q[2])
+        l = float(q[3])
+        dtheta = float(dq[2])
+        dl = float(dq[3])
+        s, c = math.sin(theta), math.cos(theta)
+        dq[0] = -dl * s - l * c * dtheta
+        dq[1] = dl * c - l * s * dtheta
+
     # ---------------------------------------------------------------- SLIP step
     def _compute_slip_forces(
         self,
@@ -77,14 +87,35 @@ class PhysicsEngine:
         foot_y_virt = y - self.cfg.leg_length * c
         foot_x_virt = x + self.cfg.leg_length * s
 
+        touchdown_event = False
+
         # Touchdown detection with landing-attitude clamp
         if (not self.stance_active) and (foot_y_virt <= self.cfg.ground_y):
+            touchdown_event = True
             theta_td = min(theta, landing_theta_target)
             q[2] = theta_td
             dq[2] = 0.0
             theta = theta_td
             s, c = math.sin(theta), math.cos(theta)
             foot_x_virt = x + self.cfg.leg_length * s
+            
+            # Enforce no-slip constraint at touchdown to prevent ground sliding
+            self._project_no_slip_velocity(q, dq)
+
+            # Touchdown constraint:
+            # 1) bottom contact point is exactly on ground (y = ground_y)
+            # 2) optional translational velocity reset (configurable)
+            q[0] = foot_x_virt - self.cfg.leg_length * s
+            q[1] = self.cfg.ground_y + self.cfg.leg_length * c
+            if self.cfg.touchdown_zero_xy_velocity:
+                dq[0] = 0.0
+                dq[1] = 0.0
+
+            # Refresh local state for force computation after projection
+            x, y = q[0], q[1]
+            dx, dy = dq[0], dq[1]
+            foot_x_virt = x + self.cfg.leg_length * s
+            foot_y_virt = y - self.cfg.leg_length * c
 
             self.stance_active = True
             self.stance_foot_anchor = np.array(
@@ -126,8 +157,13 @@ class PhysicsEngine:
             natural_liftoff = (l_curr >= self.cfg.leg_length) and (dl > 0.0) and reached_takeoff
             if natural_liftoff or over_extended:
                 self.stance_active = False
+        
+        # Hard no-slip constraint: during stance, foot must not slide
+        # This is enforced by the stance anchor and contact dynamics
+        # but we reinforce it here to prevent numerical drift.
+        # (The velocity projection happens in _apply_stance_correction after integration.)
 
-        return F_act_x, F_act_y, F_spring_x, F_spring_y, touching, l_curr, dl
+        return F_act_x, F_act_y, F_spring_x, F_spring_y, touching, l_curr, dl, touchdown_event
 
     # --------------------------------------------------- legacy spring-damper
     def _compute_legacy_forces(
@@ -162,6 +198,63 @@ class PhysicsEngine:
 
         return F_act_x, F_act_y, F_spring_x, F_spring_y, touching, l_curr, dl
 
+    def _compute_flight_eom_accel(
+        self,
+        q: np.ndarray,
+        dq: np.ndarray,
+        F1: float,
+        F2: float,
+        tau_att: float,
+    ) -> np.ndarray:
+        """Compute qdd from flight EOM: M(q) qdd + B(q,dq) + G(q) = F(q)."""
+        x, y, theta, l = [float(v) for v in q]
+        dx, dy, dtheta, dl = [float(v) for v in dq]
+
+        m_total = float(self.cfg.mass)
+        m1 = float(np.clip(self.cfg.eom_leg_mass_ratio, 0.05, 0.95)) * m_total
+        m2 = m_total - m1
+        cth = math.cos(theta)
+        sth = math.sin(theta)
+        g = self.cfg.gravity
+        k = self.cfg.eom_leg_k
+        b = self.cfg.eom_leg_damping
+
+        M = np.array([
+            [m1 + m2, 0.0, l * m1 * cth, m1 * sth],
+            [0.0, m1 + m2, -l * m1 * sth, m1 * cth],
+            [l * m1 * cth, -l * m1 * sth, self.cfg.inertia + (l ** 2) * m1, 0.0],
+            [m1 * sth, m1 * cth, 0.0, m1],
+        ], dtype=np.float64)
+
+        B = np.array([
+            dtheta * m1 * (2.0 * dl * cth - dtheta * l * sth),
+            -dtheta * m1 * (2.0 * dl * sth + dtheta * l * cth),
+            -2.0 * m1 * (dl * dy * sth - dl * dx * cth - dl * dtheta * l + dtheta * dy * l * cth + dtheta * dx * l * sth),
+            b * dl + (dtheta ** 2) * l * m1 + 2.0 * dtheta * dx * m1 * cth - 2.0 * dtheta * dy * m1 * sth,
+        ], dtype=np.float64)
+
+        G = np.array([
+            0.0,
+            (m1 + m2) * g,
+            -g * l * m1 * sth,
+            k * (l - self.cfg.leg_length) + m1 * g * cth,
+        ], dtype=np.float64)
+
+        F = np.array([
+            (F1 + F2) * sth,
+            (F1 + F2) * cth,
+            (F1 - F2) * self.cfg.cg_to_motor + tau_att,
+            0.0,
+        ], dtype=np.float64)
+
+        rhs = F - B - G
+        try:
+            qdd = np.linalg.solve(M, rhs)
+        except np.linalg.LinAlgError:
+            qdd = np.linalg.pinv(M) @ rhs
+
+        return np.clip(qdd, -self.cfg.eom_ddq_clip, self.cfg.eom_ddq_clip)
+
     # ---------------------------------------------------------------- main step
     def step(
         self,
@@ -194,7 +287,7 @@ class PhysicsEngine:
 
         # Compute contact forces
         if self.cfg.use_slip_stance:
-            F_act_x, F_act_y, F_sx, F_sy, touching, l_curr, dl = (
+            F_act_x, F_act_y, F_sx, F_sy, touching, l_curr, dl, touchdown_event = (
                 self._compute_slip_forces(
                     q,
                     dq,
@@ -205,22 +298,46 @@ class PhysicsEngine:
                 )
             )
         else:
+            touchdown_event = False
             F_act_x, F_act_y, F_sx, F_sy, touching, l_curr, dl = (
                 self._compute_legacy_forces(q, dq, F_total)
             )
 
-        # Accelerations
-        ddx = (F_act_x + F_sx) / self.cfg.mass
-        ddy = (F_act_y + F_sy) / self.cfg.mass - self.cfg.gravity
-        ddtheta = 0.0 if self.stance_active else tau / self.cfg.inertia
+        # Flight-phase attitude assist (PD torque) to suppress aerial somersaults
+        tau_att = 0.0
+        if (not self.stance_active) and self.cfg.flight_attitude_assist:
+            theta_err = self.wrap_angle(q[2] - landing_theta_target)
+            tau_att = -self.cfg.flight_att_kp * theta_err - self.cfg.flight_att_kd * dq[2]
+            tau_att = float(np.clip(tau_att, -self.cfg.flight_att_tau_limit, self.cfg.flight_att_tau_limit))
 
-        # Symplectic Euler: update velocities first, then positions
-        dq[0] += ddx     * self.cfg.dt
-        dq[1] += ddy     * self.cfg.dt
-        dq[2] += ddtheta * self.cfg.dt
-        q[0]  += dq[0]   * self.cfg.dt
-        q[1]  += dq[1]   * self.cfg.dt
-        q[2]  += dq[2]   * self.cfg.dt
+        # Accelerations
+        if (not self.stance_active) and self.cfg.use_flight_eom:
+            qdd = self._compute_flight_eom_accel(q, dq, F1, F2, tau_att)
+            dq[0] += qdd[0] * self.cfg.dt
+            dq[1] += qdd[1] * self.cfg.dt
+            dq[2] += qdd[2] * self.cfg.dt
+            dq[3] += qdd[3] * self.cfg.dt
+            q[0] += dq[0] * self.cfg.dt
+            q[1] += dq[1] * self.cfg.dt
+            q[2] += dq[2] * self.cfg.dt
+            q[3] += dq[3] * self.cfg.dt
+            q[3] = float(np.clip(q[3], self.cfg.leg_min_length, self.cfg.leg_length + self.cfg.stroke_length))
+        else:
+            ddx = (F_act_x + F_sx) / self.cfg.mass
+            ddy = (F_act_y + F_sy) / self.cfg.mass - self.cfg.gravity
+            ddtheta = 0.0 if self.stance_active else (tau + tau_att) / self.cfg.inertia
+
+            dq[0] += ddx * self.cfg.dt
+            dq[1] += ddy * self.cfg.dt
+            dq[2] += ddtheta * self.cfg.dt
+            q[0] += dq[0] * self.cfg.dt
+            q[1] += dq[1] * self.cfg.dt
+            q[2] += dq[2] * self.cfg.dt
+
+            # Optional touchdown translational speed clamp.
+            if touchdown_event and self.cfg.touchdown_zero_xy_velocity:
+                dq[0] = 0.0
+                dq[1] = 0.0
 
         # Stance post-correction: lock geometry to anchor
         if self.cfg.use_slip_stance and self.stance_active:
@@ -228,9 +345,13 @@ class PhysicsEngine:
 
         # Update leg state in q/dq
         if self.stance_active:
-            q[3] = l_curr
-            dq[3] = dl
-        else:
+            # For SLIP stance, q[3]/dq[3] are already refreshed in
+            # _apply_stance_correction using current post-integration state.
+            # Avoid overwriting them with stale pre-integration (l_curr, dl).
+            if not self.cfg.use_slip_stance:
+                q[3] = l_curr
+                dq[3] = dl
+        elif not self.cfg.use_flight_eom:
             q[3] = self.cfg.leg_length
             dq[3] = 0.0
 
@@ -254,3 +375,7 @@ class PhysicsEngine:
         l_curr = max(math.sqrt(r_x ** 2 + r_y ** 2), 1e-6)
         e_x, e_y = r_x / l_curr, r_y / l_curr
         dq[3] = dq[0] * e_x + dq[1] * e_y
+
+        # No-slip foot constraint (high friction assumption):
+        # d/dt(x + l sinθ)=0, d/dt(y - l cosθ)=0
+        self._project_no_slip_velocity(q, dq)

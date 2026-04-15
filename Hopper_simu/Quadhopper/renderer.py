@@ -85,6 +85,18 @@ class QuadhopperRenderer:
         leg_vec_render = leg_vec * render_scale
         render_foot = com + leg_vec_render
 
+        # Prevent visual ground penetration of rendered foot marker.
+        # With render_scale > 1, direct scaling can place render_foot below y=0
+        # even when the physical foot is exactly on ground.
+        ground_y = float(env.pcfg.ground_y)
+        if render_foot[1] < ground_y:
+            d = render_foot - com
+            if abs(d[1]) > 1e-8:
+                t = (ground_y - com[1]) / d[1]
+                t = float(np.clip(t, 0.0, 1.0))
+                render_foot = com + t * d
+            render_foot[1] = ground_y
+
         body_dir = np.array([leg_dir[1], -leg_dir[0]], dtype=np.float64)
         body_half_render = env.pcfg.beam_half_length * render_scale
         body_l = com - body_half_render * body_dir

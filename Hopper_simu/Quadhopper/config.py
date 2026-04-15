@@ -19,13 +19,31 @@ class PhysicsConfig:
     ground_y: float = 0.0
 
     # Legacy spring-damper model
-    k_spring: float = 150.0
+    k_spring: float = 500.0
     c_damping: float = 20.0
 
     # SLIP stance model
     use_slip_stance: bool = True
     k_slip: float = 2200.0
     c_slip: float = 18.0
+
+    # Flight attitude assist (to prevent uncontrolled aerial flips)
+    flight_attitude_assist: bool = True
+    flight_att_kp: float = 8.0
+    flight_att_kd: float = 1.5
+    flight_att_tau_limit: float = 1.6
+
+    # Flight equation-of-motion (EOM) constraint
+    use_flight_eom: bool = True
+    eom_leg_mass_ratio: float = 0.28   # m1 / (m1 + m2)
+    eom_leg_damping: float = 0.9       # b term in l equation
+    eom_leg_k: float = 260.0           # spring term k(l-l0)
+    eom_ddq_clip: float = 180.0
+
+    # Touchdown impulse handling
+    # If enabled, translational velocity is forced to zero at touchdown,
+    # which may over-constrain and trap the hopper near the contact point.
+    touchdown_zero_xy_velocity: bool = False
 
     @property
     def beam_half_length(self) -> float:
@@ -95,23 +113,30 @@ class EnvConfig:
     traj_tilt_min_deg: float = 20.0
     traj_tilt_max_deg: float = 40.0
 
+    # Ballistic planning shape controls
+    # Larger values -> higher apex, usually less leg compression near touchdown.
+    traj_apex_scale: float = 1.22
+    traj_apex_clearance: float = 0.22
+    traj_min_vx: float = 1.0
+    traj_max_vx: float = 8.0
+
 
 @dataclass
 class RewardConfig:
     """All reward shaping weights."""
     # --- Flight phase ---
-    flight_traj_track_weight: float = 1.8
-    flight_traj_track_sharpness: float = 8.0
-    flight_dy_track_weight: float = 0.8
-    flight_dy_track_sharpness: float = 0.25
+    flight_traj_track_weight: float = 4.5
+    flight_traj_track_sharpness: float = 12.0
+    flight_dy_track_weight: float = 2.2
+    flight_dy_track_sharpness: float = 0.35
     flight_target_weight: float = 2.0
     flight_target_sharpness: float = 1.6
     flight_overshoot_penalty: float = 2.5
     flight_thrust_penalty: float = 0.08
     flight_vx_track_penalty: float = 0.12
-    flight_attitude_weight: float = 0.7
+    flight_attitude_weight: float = 1.1
     flight_attitude_sharpness: float = 6.0
-    flight_angular_vel_penalty: float = 0.03
+    flight_angular_vel_penalty: float = 0.06
     first_target_weight: float = 2.0
     first_target_sharpness: float = 1.2
 
@@ -130,8 +155,8 @@ class RewardConfig:
     liftoff_sharpness: float = 6.0
 
     # --- General attitude penalty ---
-    attitude_abs_penalty: float = 0.02
-    angular_vel_penalty: float = 0.04
+    attitude_abs_penalty: float = 0.04
+    angular_vel_penalty: float = 0.08
 
     # --- Target hit ---
     target_hit_reward: float = 150.0
