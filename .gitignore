@@ -2,3 +2,4 @@
 __pycache__/
 *_steps.zip
 .DS_Store
+.claude/worktrees/
