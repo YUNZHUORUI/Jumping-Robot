@@ -1,5 +1,74 @@
-.venv/
+# ===== Python =====
 __pycache__/
-*_steps.zip
+*.py[cod]
+*$py.class
+*.so
+.Python
+.venv/
+venv/
+env/
+.pytest_cache/
+.mypy_cache/
+.ipynb_checkpoints/
+
+# ===== OS / Editor =====
 .DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# ===== Claude Code =====
 .claude/worktrees/
+
+# ===== 训练日志 / Tensorboard =====
+logs/
+runs/
+tb_logs/
+wandb/
+outputs/
+events.out.tfevents.*
+
+# ===== 模型权重 / Checkpoints =====
+# 这些文件通常很大，建议用网盘或 Git LFS
+*.pt
+*.pth
+*.ckpt
+*.zip
+*.h5
+*.pkl
+*.onnx
+*.safetensors
+
+# ===== 3D 模型 / 资产文件（大文件）=====
+# 如果需要版本控制，改用 Git LFS
+*.stl
+*.usd
+*.usda
+*.usdc
+*.usdz
+*.obj
+*.fbx
+*.glb
+*.gltf
+
+# ===== 调试输出 / 媒体 =====
+*.gif
+*.mp4
+*.avi
+*.mov
+# 截图/调试图（如果有需要展示的 README 图，单独 git add -f 强制添加）
+debug_*.png
+*_debug.png
+
+# 例外：README 引用的展示文件保留
+!Adobe Express - PixPin_2026-02-06_00-07-40.gif
+
+# ===== Isaac Sim 特定 =====
+Hopper-sim-Isaac/logs/
+Hopper-sim-Isaac/outputs/
+*.usd.tmp
+
+# ===== 项目特定（旧的、临时的）=====
+# 如果以后整理，可以加具体路径
