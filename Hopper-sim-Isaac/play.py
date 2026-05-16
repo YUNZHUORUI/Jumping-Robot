@@ -26,17 +26,17 @@ _p = os.path.join(_ISAACLAB_SOURCE, "isaaclab_rl")
 if _p not in sys.path:
     sys.path.insert(0, _p)
 
-import Ruigang_smi
+import Quadhopper_Isaac
 import gymnasium as gym
 from isaaclab_rl.rsl_rl import RslRlVecEnvWrapper
 from rsl_rl.runners import OnPolicyRunner
 
-from Ruigang_smi.my_quadcopter_env import QuadcopterEnvCfg
-from Ruigang_smi.rsl_rl_ppo_cfg import QuadcopterPPORunnerCfg
+from Quadhopper_Isaac.my_hopper_env import HopperEnvCfg
+from Quadhopper_Isaac.rsl_rl_ppo_cfg import HopperPPORunnerCfg
 
 
 def find_latest_checkpoint():
-    log_root = os.path.join(os.path.dirname(__file__), "logs", "rsl_rl", "myquadcopter")
+    log_root = os.path.join(os.path.dirname(__file__), "logs", "rsl_rl", "myhopper")
     if not os.path.exists(log_root):
         return None
     runs = sorted(os.listdir(log_root))
@@ -49,37 +49,55 @@ def find_latest_checkpoint():
 
 
 def main():
-    checkpoint = args_cli.checkpoint or find_latest_checkpoint()
-    if checkpoint is None:
-        print("[ERROR] No checkpoint found. Please specify --checkpoint path/to/model.pt")
-        return
-    print(f"[INFO] Loading checkpoint: {checkpoint}")
-
-    env_cfg = QuadcopterEnvCfg()
-    env_cfg.scene.num_envs = args_cli.num_envs
-    env_cfg.episode_length_s = 30.0
-
-    env = gym.make("myquadcopter", cfg=env_cfg)
-    env = RslRlVecEnvWrapper(env)
-
-    runner_cfg = QuadcopterPPORunnerCfg()
-    runner = OnPolicyRunner(env, runner_cfg.to_dict(), log_dir=None, device="cuda:0")
-    runner.load(checkpoint)
-
-    policy = runner.get_inference_policy(device="cuda:0")
-
-    obs = env.get_observations()
-    print("[INFO] Running policy. Press Ctrl+C to stop.")
+    import traceback
     try:
-        while simulation_app.is_running():
-            with torch.no_grad():
-                actions = policy(obs)
-            obs, _, _, _ = env.step(actions)
-    except KeyboardInterrupt:
-        pass
+        checkpoint = args_cli.checkpoint or find_latest_checkpoint()
+        if checkpoint is None:
+            print("[ERROR] No checkpoint found. Please specify --checkpoint path/to/model.pt")
+            return
+        print(f"[INFO] Loading checkpoint: {checkpoint}")
 
-    env.close()
-    simulation_app.close()
+        print("[DEBUG] Creating env config...")
+        env_cfg = HopperEnvCfg()
+        env_cfg.scene.num_envs = args_cli.num_envs
+        env_cfg.episode_length_s = 30.0
+
+        print("[DEBUG] Creating gym environment...")
+        env = gym.make("myhopper", cfg=env_cfg)
+        print("[DEBUG] Wrapping with RslRlVecEnvWrapper...")
+        env = RslRlVecEnvWrapper(env)
+
+        print("[DEBUG] Creating OnPolicyRunner...")
+        runner_cfg = HopperPPORunnerCfg()
+        runner = OnPolicyRunner(env, runner_cfg.to_dict(), log_dir=None, device="cuda:0")
+        print("[DEBUG] Loading checkpoint...")
+        runner.load(checkpoint)
+
+        print("[DEBUG] Getting inference policy...")
+        policy = runner.get_inference_policy(device="cuda:0")
+
+        print("[DEBUG] Getting initial observations...")
+        obs = env.get_observations()
+        print(f"[DEBUG] obs type={type(obs)}, starting simulation loop...")
+        print("[INFO] Running policy. Press Ctrl+C to stop.")
+        try:
+            while simulation_app.is_running():
+                with torch.inference_mode():
+                    actions = policy(obs)
+                obs, _, dones, _ = env.step(actions)
+        except KeyboardInterrupt:
+            pass
+
+    except Exception:
+        print("\n[FATAL] Unhandled exception in play.py:")
+        traceback.print_exc()
+        print("[FATAL] See traceback above. Closing gracefully.")
+    finally:
+        try:
+            env.close()
+        except Exception:
+            pass
+        simulation_app.close()
 
 
 if __name__ == "__main__":

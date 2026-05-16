@@ -3,7 +3,7 @@ import isaaclab.sim as sim_utils
 from isaaclab.assets import ArticulationCfg
 
 CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
-USD_PATH = os.path.join(CURRENT_DIR, "DroneAsset.usd")
+USD_PATH = os.path.join(CURRENT_DIR, "QuadhopperAsset.usd")
 
 MY_DRONE_CFG = ArticulationCfg(
     spawn=sim_utils.UsdFileCfg(

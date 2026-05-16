@@ -67,7 +67,7 @@ class QuadcopterEnvCfg(DirectRLEnvCfg):
     )
 
     scene: InteractiveSceneCfg = InteractiveSceneCfg(
-        num_envs=4096, env_spacing=1.5, replicate_physics=True, clone_in_fabric=True
+        num_envs=1024, env_spacing=2.0, replicate_physics=False, clone_in_fabric=False
     )
 
     robot: ArticulationCfg = MY_DRONE_CFG.replace(prim_path="/World/envs/env_.*/Robot")
@@ -104,7 +104,9 @@ class QuadcopterEnv(DirectRLEnv):
         self.dr_tm = torch.ones(self.num_envs, 4, device=self.device) * 0.015
 
         self._dt_policy = self.sim.cfg.dt * self.cfg.decimation
-        self._body_id = self._robot.find_bodies(".*")[0]
+        # 新版资产把刚体改成了 /Robot/body（articulation root 上层是 Xform）
+        body_ids, _ = self._robot.find_bodies("body")
+        self._body_id = body_ids[0:1]
 
         self._episode_sums = {
             key: torch.zeros(self.num_envs, dtype=torch.float, device=self.device)
@@ -149,7 +151,7 @@ class QuadcopterEnv(DirectRLEnv):
         F = F * self.dr_thrust_multi / self.dr_mass_multi
 
         L = 0.0813
-        K_tau = 1.985850e-02
+        K_tau = 3.0e-02
         F1, F2, F3, F4 = F[:, 0], F[:, 1], F[:, 2], F[:, 3]
         u1, u2, u3, u4 = u[:, 0], u[:, 1], u[:, 2], u[:, 3]
 
