@@ -21,7 +21,6 @@ class PhysicsConfig:
     # Legacy spring-damper model
     k_spring: float = 500.0
     c_damping: float = 20.0
-
     # SLIP stance model
     use_slip_stance: bool = True
     k_slip: float = 2200.0
@@ -120,6 +119,12 @@ class EnvConfig:
     traj_min_vx: float = 1.0
     traj_max_vx: float = 8.0
 
+    # Anti-local-optimum guards
+    # If the policy keeps pressing in stance too long, terminate early.
+    max_consecutive_stance_steps: int = 180
+    # Expected minimum airborne steps after liftoff before returning stance.
+    min_airborne_steps: int = 8
+
 
 @dataclass
 class RewardConfig:
@@ -153,6 +158,17 @@ class RewardConfig:
     # --- Liftoff event ---
     liftoff_reward: float = 25.0
     liftoff_sharpness: float = 6.0
+
+    # --- Anti-hacking shaping ---
+    # Penalize staying compressed in stance (discourages crouch-and-freeze local optimum)
+    stance_compression_penalty: float = 0.65
+    # Small per-step penalty while touching to encourage timely liftoff
+    stance_stall_penalty: float = 0.06
+    # Reward being airborne at meaningful COM height
+    airborne_height_reward: float = 0.30
+    airborne_height_ref: float = 0.18
+    # Strong penalty when stance lasts too long and episode is force-terminated
+    stance_timeout_penalty: float = 80.0
 
     # --- General attitude penalty ---
     attitude_abs_penalty: float = 0.04

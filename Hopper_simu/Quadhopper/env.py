@@ -34,6 +34,8 @@ class QuadhopperTargetEnv(gym.Env):
         self.current_target_idx = 0
         self.steps = 0
         self.prev_touching = False
+        self.stance_steps = 0
+        self.airborne_steps = 0
 
     def reset(self, seed=None, options=None):
         super().reset(seed=seed)
@@ -43,9 +45,10 @@ class QuadhopperTargetEnv(gym.Env):
             math.radians(self.ecfg.init_theta_min_deg),
             math.radians(self.ecfg.init_theta_max_deg),
         )
-        init_y = self.pcfg.leg_length * math.cos(init_theta)
+        # q uses foot coordinates, so initialize foot on the ground.
+        init_foot_y = self.pcfg.ground_y
 
-        self.q = np.array([0.0, init_y, init_theta, self.pcfg.leg_length], dtype=np.float64)
+        self.q = np.array([0.0, init_foot_y, init_theta, self.pcfg.leg_length], dtype=np.float64)
         self.dq = np.zeros(4, dtype=np.float64)
 
         self.physics.reset()
@@ -53,8 +56,11 @@ class QuadhopperTargetEnv(gym.Env):
         self.current_target_idx = 0
         self.steps = 0
         self.prev_touching = False
+        self.stance_steps = 0
+        self.airborne_steps = 0
 
-        self.planner.plan(self.q[0], self.q[1], self.ecfg.targets[self.current_target_idx], rng=rng)
+        com_pos = self.physics.get_com_pos(self.q)
+        self.planner.plan(com_pos[0], com_pos[1], self.ecfg.targets[self.current_target_idx], rng=rng)
 
         if self.planner.valid:
             v_x_nom, v_y_nom = self.planner.get_initial_velocity()
@@ -92,10 +98,11 @@ class QuadhopperTargetEnv(gym.Env):
         return self.physics.get_foot_pos(self.q)
 
     def get_trajectory_state(self, x_current: float):
-        return self.planner.get_state(x_current, v_x=self.dq[0])
+        com_vx = self.physics.get_com_vel(self.q, self.dq)[0]
+        return self.planner.get_state(x_current, v_x=com_vx)
 
     def _get_obs(self):
-        foot_pos = self.get_foot_pos()
+        foot_pos = self.physics.get_foot_pos(self.q)
         if self.current_target_idx < len(self.ecfg.targets):
             target_x = self.ecfg.targets[self.current_target_idx]
         else:
@@ -103,9 +110,9 @@ class QuadhopperTargetEnv(gym.Env):
 
         dist_x = target_x - foot_pos[0]
         is_touching = 1.0 if foot_pos[1] <= self.pcfg.ground_y + 0.02 else 0.0
-        y_ideal, dy_ideal = self.get_trajectory_state(self.q[0])
-        y_error = self.q[1] - y_ideal
-        dy_error = self.dq[1] - dy_ideal
+        y_ideal, dy_ideal = self.get_trajectory_state(self.physics.get_com_pos(self.q)[0])
+        y_error = self.physics.get_com_pos(self.q)[1] - y_ideal
+        dy_error = self.physics.get_com_vel(self.q, self.dq)[1] - dy_ideal
 
         obs = np.concatenate([
             self.q,
@@ -130,7 +137,14 @@ class QuadhopperTargetEnv(gym.Env):
         touchdown_event = touching and (not self.prev_touching)
         liftoff_event = (not touching) and self.prev_touching
 
-        foot_pos = self.get_foot_pos()
+        if touching:
+            self.stance_steps += 1
+            self.airborne_steps = 0
+        else:
+            self.airborne_steps += 1
+            self.stance_steps = 0
+
+        foot_pos = self.physics.get_foot_pos(self.q)
         target_valid = self.current_target_idx < len(self.ecfg.targets)
         target_x = self.ecfg.targets[self.current_target_idx] if target_valid else foot_pos[0]
         dist_to_target = abs(foot_pos[0] - target_x) if target_valid else 0.0
@@ -139,8 +153,9 @@ class QuadhopperTargetEnv(gym.Env):
         all_targets_done = False
         terminated = False
         truncated = False
+        stance_timeout = False
 
-        if touching and self.dq[1] > -0.5 and target_valid:
+        if touching and self.physics.get_com_vel(self.q, self.dq)[1] > -0.5 and target_valid:
             if dist_to_target < self.ecfg.target_tolerance:
                 target_hit = True
                 print(
@@ -152,13 +167,19 @@ class QuadhopperTargetEnv(gym.Env):
                     all_targets_done = True
                     terminated = True
                 else:
-                    self.planner.plan(self.q[0], self.q[1], self.ecfg.targets[self.current_target_idx])
+                    com_pos = self.physics.get_com_pos(self.q)
+                    self.planner.plan(com_pos[0], com_pos[1], self.ecfg.targets[self.current_target_idx])
+
+                # Anti-local-optimum guard: terminate if policy keeps collapsing in stance.
+                if touching and self.stance_steps >= self.ecfg.max_consecutive_stance_steps:
+                    stance_timeout = True
+                    terminated = True
 
         # Remove angle-limit termination to avoid trapping policy in local optimum.
         # Keep only safety-related vertical bounds.
         terminated_bad = (
-            self.q[1] > self.reward_fn.cfg.max_height
-            or self.q[1] < self.pcfg.min_com_height
+            self.physics.get_com_pos(self.q)[1] > self.reward_fn.cfg.max_height
+            or self.physics.get_com_pos(self.q)[1] < self.pcfg.min_com_height
         )
         out_of_bounds = (
             self.q[0] < -1.0
@@ -167,14 +188,14 @@ class QuadhopperTargetEnv(gym.Env):
         if terminated_bad or out_of_bounds:
             terminated = True
 
-        y_ideal, dy_ideal = self.get_trajectory_state(self.q[0])
-        y_error = self.q[1] - y_ideal
-        dy_error = self.dq[1] - dy_ideal
+        y_ideal, dy_ideal = self.get_trajectory_state(self.physics.get_com_pos(self.q)[0])
+        y_error = self.physics.get_com_pos(self.q)[1] - y_ideal
+        dy_error = self.physics.get_com_vel(self.q, self.dq)[1] - dy_ideal
 
         reward, reward_info = self.reward_fn.compute(
             theta=self.q[2],
             dtheta=self.dq[2],
-            vx=self.dq[0],
+            vx=self.physics.get_com_vel(self.q, self.dq)[0],
             touching=touching,
             touchdown_event=touchdown_event,
             liftoff_event=liftoff_event,
@@ -182,6 +203,10 @@ class QuadhopperTargetEnv(gym.Env):
             y_error=y_error,
             dy_error=dy_error,
             traj_vx_nom=self.planner.vx_nom,
+            com_y=self.physics.get_com_pos(self.q)[1],
+            l_curr=self.q[3],
+            l_nominal=self.pcfg.leg_length,
+            stroke_length=self.pcfg.stroke_length,
             landing_theta_target=self.acfg.landing_theta,
             takeoff_theta_target=self.planner.takeoff_theta_target,
             u1=u1,
@@ -195,6 +220,7 @@ class QuadhopperTargetEnv(gym.Env):
             all_targets_done=all_targets_done,
             terminated_bad=terminated_bad,
             out_of_bounds=out_of_bounds,
+            stance_timeout=stance_timeout,
         )
 
         self.steps += 1

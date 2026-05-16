@@ -22,7 +22,7 @@ class QuadhopperTargetEnv(gym.Env):
 
         # ==================== 1. Physics Parameters (FIXED) ====================
         self.dt = 0.002
-        self.m = 0.213 #kg
+        self.m = 1.21
         self.rotor_span = 0.10  # Distance between two rotors (m)
         self.beam_half_length = 0.5 * self.rotor_span
         self.lc = self.beam_half_length  # CG to each rotor (torque arm)
@@ -31,15 +31,18 @@ class QuadhopperTargetEnv(gym.Env):
         self.stroke_length = 0.20  # Max compression/extension stroke (m)
         self.leg_min_length = max(0.05, self.l0 - self.stroke_length)
         self.min_com_height = max(0.04, 0.35 * self.leg_min_length)
+        self.max_tilt_rad = math.radians(80.0)
         self.J = 0.15  # Inertia
         self.g = 9.81
         self.max_thrust = 30.0
         self.ground_y = 0.0
 
-        # ==================== Rendering Scale Factor ====================
-        # 仅用于可视化，不影响物理计算
-        self.render_geom_scale = 2.5
-        self.render_rotor_size = 55.0
+        # Rendering config for small-size model
+        self.render_frame_stride = 2
+        self.render_dpi = 120
+        self.render_body_scale = 3.2
+        self.render_view_w = max(1.8, 6.0 * self.l0)
+        self.render_view_h = max(1.1, 3.6 * self.l0)
 
         # --- FIX 2: Ground Penetration ---
         # Increased significantly to make the ground stiffer and reduce penetration depth
@@ -80,7 +83,6 @@ class QuadhopperTargetEnv(gym.Env):
         self.traj_b_local = 0.0
         self.traj_x0 = 0.0
         self.traj_y0 = 0.0
-        self.traj_vx_nom = 0.0
         self.traj_valid = False
 
         # Randomized launch state for robustness (instead of perfect ballistic init)
@@ -204,8 +206,6 @@ class QuadhopperTargetEnv(gym.Env):
         self.traj_b_local = tan_a
         self.traj_x0 = x_curr
         self.traj_y0 = y_curr
-        v0 = math.sqrt(max(v0_sq, 1e-6))
-        self.traj_vx_nom = max(0.2, v0 * cos_a)
         self.traj_valid = True
 
     def get_trajectory_state(self, x_current):
@@ -224,9 +224,9 @@ class QuadhopperTargetEnv(gym.Env):
         slope_ideal = 2 * self.traj_a * dx + self.traj_b_local
 
         # 3. Ideal vertical velocity (dy/dt) = (dy/dx) * (dx/dt)
-        # Use planned nominal vx (instead of current vx) to avoid policy exploiting high-speed jumps
-        vx_ref = self.traj_vx_nom if self.traj_vx_nom > 0.0 else max(0.1, self.dq[0])
-        dy_ideal = slope_ideal * vx_ref
+        # Use current horizontal velocity to scale vertical velocity requirement
+        current_vx = max(0.1, self.dq[0])
+        dy_ideal = slope_ideal * current_vx
 
         return y_ideal, dy_ideal
 
@@ -341,7 +341,7 @@ class QuadhopperTargetEnv(gym.Env):
                     comp_rate = -(dx * s - dy * c)
                     F_mag = self.k_spring * compression + self.c_damping * comp_rate
                     F_mag = max(0.0, F_mag)
-                    F_spring_x = -F_mag * s
+                    F_spring_x = -F_mag * sx
                     F_spring_y = F_mag * c
 
         # Dynamics Integration (Symplectic Euler)
@@ -381,8 +381,7 @@ class QuadhopperTargetEnv(gym.Env):
 
         foot_pos = self.get_foot_pos()
         target_valid = self.current_target_idx < len(self.targets)
-        target_x = self.targets[self.current_target_idx] if target_valid else foot_pos[0]
-        dist_to_target = abs(foot_pos[0] - target_x) if target_valid else 0.0
+        dist_to_target = abs(foot_pos[0] - self.targets[self.current_target_idx]) if target_valid else 0.0
         touchdown_event = touching and (not self.prev_touching)
         liftoff_event = (not touching) and self.prev_touching
 
@@ -391,23 +390,12 @@ class QuadhopperTargetEnv(gym.Env):
             y_ideal, dy_ideal = self.get_trajectory_state(self.q[0])
             error_y = abs(self.q[1] - y_ideal)
 
-            # 跟踪奖励：强化抛物线高度跟踪
-            reward += 1.8 * math.exp(-8.0 * error_y)
-
-            # 强化 target 接近度，抑制“跳很远”投机策略
-            if target_valid:
-                reward += 2.0 * math.exp(-1.6 * dist_to_target)
-                overshoot = foot_pos[0] - target_x
-                if overshoot > 0.0:
-                    reward -= 2.5 * overshoot
+            # 跟踪奖励：放宽指数惩罚，让它更容易学
+            reward += 1.0 * math.exp(-5.0 * error_y)
 
             # 关键修复：空中推力惩罚！
             # 抛物线是重力主导的，在空中开电机会改变弹道并带来力矩。鼓励空中“滑翔”。
-            reward -= 0.08 * (u1 + u2)
-
-            # 水平速度约束：贴近轨迹规划速度，避免一味冲刺
-            if self.traj_vx_nom > 0.0:
-                reward -= 0.12 * abs(self.dq[0] - self.traj_vx_nom)
+            reward -= 0.05 * (u1 + u2)
 
             # Flight attitude tracking for negative-angle touchdown
             theta_err_land = abs(self._wrap_angle(self.q[2] - self.landing_theta_target))
@@ -416,7 +404,7 @@ class QuadhopperTargetEnv(gym.Env):
 
             # First target shaping: reduce large miss distance at the first jump.
             if target_valid and self.current_target_idx == 0:
-                reward += 2.0 * math.exp(-1.2 * dist_to_target)
+                reward += 1.0 * math.exp(-0.9 * dist_to_target)
 
         # Touchdown attitude constraint (must land with negative tilt)
         if touchdown_event:
@@ -441,7 +429,7 @@ class QuadhopperTargetEnv(gym.Env):
         reward -= 0.08 * abs(self.q[2])
         reward -= 0.1 * abs(self.dq[2])  # 旋转角速度惩罚加大，防止一直转
 
-        # 3. 落地与判定逻辑``
+        # 3. 落地与判定逻辑
         if touching and self.dq[1] > -0.5 and target_valid:
             if dist_to_target < self.target_tolerance:
                 reward += 150.0
@@ -454,19 +442,19 @@ class QuadhopperTargetEnv(gym.Env):
                 else:
                     self._plan_trajectory()
             elif dist_to_target < 1.5:
-                reward += 10.0 * (1.5 - dist_to_target)
+                reward += 5.0 * (1.5 - dist_to_target)
 
         # 4. 终止条件 (更严的倾角限制)
-        if abs(self.q[2]) > 0.7 or self.q[1] > 7.0 or self.q[1] < self.min_com_height:
+        if abs(self.q[2]) > self.max_tilt_rad or self.q[1] > 7.0 or self.q[1] < self.min_com_height:
             terminated = True
             reward -= 100.0
 
         if self.q[0] < -1.0 or (
             self.current_target_idx < len(self.targets)
-            and foot_pos[0] > self.targets[self.current_target_idx] + 1.0
+            and foot_pos[0] > self.targets[self.current_target_idx] + 3.0
         ):
             terminated = True
-            reward -= 90.0
+            reward -= 50.0
 
         self.steps += 1
         self.prev_touching = touching
@@ -538,14 +526,18 @@ if __name__ == '__main__':
             history['target_y'].append(traj_y)
 
             # --- Rendering GIF ---
-            if i % 3 == 0:  # Render every 3rd frame for speed
-                fig = plt.figure(figsize=(12, 6), dpi=80)
+            if i % env.render_frame_stride == 0:
+                fig = plt.figure(figsize=(9, 15), dpi=env.render_dpi)
                 ax = fig.add_subplot(111)
 
                 cx = obs[0]
-                # 收紧视窗，保证机身细节可见
-                ax.set_xlim((cx - 2.0), (cx + 3.0))
-                ax.set_ylim(-0.2, 2.8)
+                view_w = env.render_view_w
+                view_h = env.render_view_h
+                x_left = cx - 0.65 * view_w
+                x_right = cx + 1.35 * view_w
+
+                ax.set_xlim(x_left, x_right)
+                ax.set_ylim(-0.12, view_h)
                 ax.set_aspect('equal')
                 ax.grid(True, alpha=0.3)
 
@@ -553,7 +545,7 @@ if __name__ == '__main__':
                 ax.axhline(0, color='k', lw=2)
                 for tid, tx in enumerate(env.targets):
                     color = 'g' if tid == env.current_target_idx else 'gray'
-                    ax.plot(tx, 0, 'x', color=color, markersize=10, markeredgewidth=3)
+                    ax.plot(tx, 0, 'x', color=color, markersize=8, markeredgewidth=2)
 
                 # Ideal Trajectory
                 if env.traj_valid:
@@ -567,49 +559,43 @@ if __name__ == '__main__':
                 x, y, theta = obs[0], obs[1], obs[2]
                 foot_pos = env.get_foot_pos()
 
-                # --- FIX: 保持渲染几何与比例一致 ---
-                # 统一几何缩放：机架长度和腿长度使用同一个比例因子
-                # 因此始终满足 leg:frame = l0:rotor_span = 0.3:0.1 = 3:1
-                render_scale = env.render_geom_scale
-                com = np.array([x, y], dtype=np.float64)
+                # --- FIX 2b: Cosmetic Render Clamp ---
+                # Visually ensure the ball doesn't look like it's underground,
+                # even if physics penetration is slightly non-zero.
+                render_foot_y = max(0.0, foot_pos[1])
 
-                leg_vec = np.array(foot_pos, dtype=np.float64) - com
-                leg_len = float(np.linalg.norm(leg_vec))
-                if leg_len > 1e-8:
-                    leg_dir = leg_vec / leg_len
-                else:
-                    # 退化兜底：若腿长过小，使用姿态角推导腿方向
-                    leg_dir = np.array([math.sin(theta), -math.cos(theta)], dtype=np.float64)
-
-                leg_vec_render = leg_vec * render_scale
-                render_foot = com + leg_vec_render
-
-                body_dir = np.array([leg_dir[1], -leg_dir[0]], dtype=np.float64)
-                body_half_render = env.beam_half_length * render_scale
-
-                body_l = com - body_half_render * body_dir
-                body_r = com + body_half_render * body_dir
-                ax.plot([body_l[0], body_r[0]], [body_l[1], body_r[1]], 'k-', lw=4.0)
+                # Body
+                beam_half_vis = env.beam_half_length * env.render_body_scale
+                body_x = [
+                    x - beam_half_vis * math.cos(theta),
+                    x + beam_half_vis * math.cos(theta)
+                ]
+                body_y = [
+                    y - beam_half_vis * math.sin(theta),
+                    y + beam_half_vis * math.sin(theta)
+                ]
+                ax.plot(body_x, body_y, 'k-', lw=7)
 
                 # Rotors (thrust visualization)
                 thrust_l = float(np.clip(action[0], 0.0, 1.0))
                 thrust_r = float(np.clip(action[1], 0.0, 1.0))
                 rotor_l_color = plt.cm.coolwarm(thrust_l)
                 rotor_r_color = plt.cm.coolwarm(thrust_r)
-                ax.scatter(body_l[0], body_l[1], s=env.render_rotor_size, c=[rotor_l_color], edgecolors='k', linewidths=0.8, zorder=5)
-                ax.scatter(body_r[0], body_r[1], s=env.render_rotor_size, c=[rotor_r_color], edgecolors='k', linewidths=0.8, zorder=5)
+                ax.scatter(body_x[0], body_y[0], s=170, c=[rotor_l_color], edgecolors='k', linewidths=1.0, zorder=5)
+                ax.scatter(body_x[1], body_y[1], s=170, c=[rotor_r_color], edgecolors='k', linewidths=1.0, zorder=5)
 
-                # Leg（真实几何，不再额外拉伸）
-                ax.plot([x, render_foot[0]], [y, render_foot[1]], 'b-', lw=2.6)
+                # Leg
+                ax.plot([x, foot_pos[0]], [y, render_foot_y], 'b-', lw=4)
                 # Foot (Red Ball)
-                ax.plot(render_foot[0], render_foot[1], 'ro', markersize=9)
+                ax.plot(foot_pos[0], render_foot_y, 'ro', markersize=14)
 
                 # Info text
                 ax.text(
-                    cx - 3.5,
-                    4.5,
+                    x_left + 0.04 * view_w,
+                    view_h - 0.08 * view_h,
                     f"Step: {i}\nTheta: {math.degrees(theta):.1f}°\nL thrust: {thrust_l:.2f}\nR thrust: {thrust_r:.2f}",
-                    fontsize=12
+                    fontsize=11,
+                    bbox=dict(facecolor='white', alpha=0.7, edgecolor='none')
                 )
 
                 fig.canvas.draw()
@@ -621,7 +607,7 @@ if __name__ == '__main__':
                 print(f"Episode finished at step {i}. Reason: Done={done}, Trunc={truncated}")
                 break
 
-        imageio.mimsave('quadhopper_fixed.gif', frames, fps=30)
+        imageio.mimsave('quadhopper_fixed.gif', frames, fps=25, loop=0)
         print("✅ GIF saved: quadhopper_fixed.gif")
 
         # ==================== Analysis Plots ====================

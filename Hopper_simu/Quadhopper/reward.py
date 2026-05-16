@@ -21,7 +21,10 @@ class RewardInfo:
     first_target: float = 0.0
     touchdown: float = 0.0
     stance_attitude: float = 0.0
+    stance_compression: float = 0.0
+    stance_stall: float = 0.0
     liftoff: float = 0.0
+    airborne_height: float = 0.0
     attitude_pen: float = 0.0
     target_hit: float = 0.0
     termination: float = 0.0
@@ -57,6 +60,11 @@ class RewardFunction:
         y_error: float,
         dy_error: float,
         traj_vx_nom: float,
+        # Geometry
+        com_y: float,
+        l_curr: float,
+        l_nominal: float,
+        stroke_length: float,
         # Attitude targets
         landing_theta_target: float,
         takeoff_theta_target: float,
@@ -75,6 +83,7 @@ class RewardFunction:
         # Termination flags
         terminated_bad: bool = False,
         out_of_bounds: bool = False,
+        stance_timeout: bool = False,
     ) -> Tuple[float, RewardInfo]:
         """
         Compute the total reward and its breakdown.
@@ -120,6 +129,11 @@ class RewardFunction:
                     -c.first_target_sharpness * dist_to_target
                 )
 
+        # Small positive signal for achieving meaningful airborne height.
+        if not touching:
+            height_margin = max(com_y - c.airborne_height_ref, 0.0)
+            info.airborne_height = c.airborne_height_reward * math.tanh(4.0 * height_margin)
+
         # ── 2. Touchdown event ─────────────────────────────────────────────
         if touchdown_event:
             theta_td_err = abs(self._wrap_angle(theta - landing_theta_target))
@@ -139,6 +153,12 @@ class RewardFunction:
             info.stance_attitude = c.stance_attitude_weight * math.exp(
                 -c.stance_attitude_sharpness * theta_to_to
             )
+
+            # Penalize deep leg compression and lingering in stance.
+            stroke = max(stroke_length, 1e-6)
+            compression_ratio = max((l_nominal - l_curr) / stroke, 0.0)
+            info.stance_compression = -c.stance_compression_penalty * (compression_ratio ** 2)
+            info.stance_stall = -c.stance_stall_penalty
 
         if liftoff_event:
             theta_lo_err = abs(
@@ -169,6 +189,8 @@ class RewardFunction:
             info.termination -= c.termination_penalty
         if out_of_bounds:
             info.termination -= c.out_of_bounds_penalty
+        if stance_timeout:
+            info.termination -= c.stance_timeout_penalty
 
         return info.total, info
 

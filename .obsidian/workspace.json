@@ -11,14 +11,12 @@
             "id": "7e208c0037150376",
             "type": "leaf",
             "state": {
-              "type": "markdown",
+              "type": "image",
               "state": {
-                "file": "Jumping-Robot-Obd/Notes/Control ststem.md",
-                "mode": "source",
-                "source": false
+                "file": "Screenshot 2025-12-17 at 3.50.04 PM.png"
               },
-              "icon": "lucide-file",
-              "title": "Control ststem"
+              "icon": "lucide-image",
+              "title": "Screenshot 2025-12-17 at 3.50.04 PM"
             }
           }
         ]
@@ -161,34 +159,35 @@
   },
   "left-ribbon": {
     "hiddenItems": {
+      "bases:新建数据库": false,
       "switcher:打开快速切换": false,
       "graph:查看关系图谱": false,
       "canvas:新建白板": false,
       "daily-notes:打开/创建今天的日记": false,
       "templates:插入模板": false,
-      "command-palette:打开命令面板": false,
-      "bases:创建新数据库": false
+      "command-palette:打开命令面板": false
     }
   },
   "active": "7e208c0037150376",
   "lastOpenFiles": [
-    "未命名.md",
+    "README.md",
+    "PPO-energy-analysis.png",
+    "ppo_limit_cycle.png",
+    "Adobe Express - PixPin_2026-02-06_00-07-40.gif",
+    "Jumping-Robot-Obd/README.md",
+    "Jumping-Robot-Obd/Notes/Test in doors.md",
+    "Jumping-Robot-Obd/Notes/Prototypes.md",
     "Jumping-Robot-Obd/Notes/Control ststem.md",
+    "Jumping-Robot-Obd/Image/jumping_robot_simulation1.gif",
+    "未命名.md",
     "Jumping-Robot-Obd/Image/jumping_robot_simulation2.gif",
     "Jumping-Robot-Obd/Image/jumping_robot_simulation.gif",
-    "Jumping-Robot-Obd/README.md",
-    "Jumping-Robot-Obd/Notes/Prototypes.md",
     "Jumping-Robot-Obd/Image/jumping_robot_v2.png",
     "Jumping-Robot-Obd/Image/IMG_0561.png",
     "Jumping-Robot-Obd/Image/jumping_robot_v1.1.png",
-    "Jumping-Robot-Obd/Image/jumping_robot_simulation1.gif",
     "Jumping-Robot-Obd/Image/jumping_robot_v1.png",
-    "Jumping-Robot-Obd/Notes/Test in doors.md",
     "Jumping-Robot-Obd/Image",
     "Jumping-Robot-Obd/untitled folder",
-    "Jumping-Robot-Obd/Notes/jumping_robot_v1.1.png",
-    "Jumping-Robot-Obd/Notes/jumping_robot_v1.png",
-    "Jumping-Robot-Obd/Notes/jumping_robot_simulation1.gif",
     "Untitled",
     "Untitled.md",
     "Jumping-Robot-Obd/Notes",

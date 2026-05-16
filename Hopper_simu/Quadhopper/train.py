@@ -96,7 +96,8 @@ def test(model_path=TRAINING.model_path, render_cfg=RENDER):
         history['theta'].append(math.degrees(float(obs[2])))
         history['thrust_l'].append(float(action[0]))
         history['thrust_r'].append(float(action[1]))
-        traj_y, _ = env.get_trajectory_state(float(obs[0]))
+        com_x = float(env.physics.get_com_pos(env.q)[0])
+        traj_y, _ = env.get_trajectory_state(com_x)
         history['target_y'].append(traj_y)
 
         renderer.maybe_render_frame(i, obs, env, action=action)

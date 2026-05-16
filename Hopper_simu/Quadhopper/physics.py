@@ -15,16 +15,10 @@ class PhysicsEngine:
 
         # Runtime stance state (reset each episode)
         self.stance_active: bool = False
-        self.stance_foot_anchor: np.ndarray = np.array(
-            [0.0, physics_cfg.ground_y], dtype=np.float64
-        )
 
     # ------------------------------------------------------------------ reset
     def reset(self):
         self.stance_active = False
-        self.stance_foot_anchor = np.array(
-            [0.0, self.cfg.ground_y], dtype=np.float64
-        )
 
     # -------------------------------------------------------- geometry helpers
     @staticmethod
@@ -34,36 +28,34 @@ class PhysicsEngine:
 
     def get_foot_pos(self, q: np.ndarray) -> np.ndarray:
         """
-        Compute foot tip (x_f, y_f) from body state.
-        During stance, returns the locked anchor point.
+        Compute foot tip (x_f, y_f) from state.
+        The state q is already geometrically formulated with (x,y) as foot.
         """
-        if self.stance_active:
-            return self.stance_foot_anchor.copy()
-        x, y, theta = q[0], q[1], q[2]
-        x_f = x + self.cfg.leg_length * math.sin(theta)
-        y_f = y - self.cfg.leg_length * math.cos(theta)
-        return np.array([x_f, y_f])
+        return np.array([q[0], q[1]])
 
-    def stance_theta_from_anchor(self, q: np.ndarray):
+    def get_com_pos(self, q: np.ndarray) -> np.ndarray:
         """
-        Recompute theta and l_curr from COM position relative to foot anchor.
-        Keeps body/leg geometry consistent during SLIP stance.
+        Compute COM position from base foot state.
         """
-        r_x = q[0] - self.stance_foot_anchor[0]
-        r_y = q[1] - self.stance_foot_anchor[1]
-        l_curr = max(math.sqrt(r_x * r_x + r_y * r_y), 1e-6)
-        theta = math.atan2(-r_x, r_y)
-        return theta, l_curr
+        x_f, y_f, theta, l = q[0], q[1], q[2], q[3]
+        return np.array([x_f + l * math.sin(theta), y_f + l * math.cos(theta)])
+
+    def get_com_vel(self, q: np.ndarray, dq: np.ndarray) -> np.ndarray:
+        """
+        Compute COM velocity from base foot point velocity.
+        """
+        dx_f, dy_f, dtheta, dl = dq[0], dq[1], dq[2], dq[3]
+        theta, l = q[2], q[3]
+        
+        dx_com = dx_f + dl * math.sin(theta) + l * math.cos(theta) * dtheta
+        dy_com = dy_f + dl * math.cos(theta) - l * math.sin(theta) * dtheta
+        return np.array([dx_com, dy_com])
 
     def _project_no_slip_velocity(self, q: np.ndarray, dq: np.ndarray):
         """Project COM velocity so foot contact velocity is zero under stance."""
-        theta = float(q[2])
-        l = float(q[3])
-        dtheta = float(dq[2])
-        dl = float(dq[3])
-        s, c = math.sin(theta), math.cos(theta)
-        dq[0] = -dl * s - l * c * dtheta
-        dq[1] = dl * c - l * s * dtheta
+        # For foot coordinates, no-slip means foot velocity is just zero
+        dq[0] = 0.0
+        dq[1] = 0.0
 
     # ---------------------------------------------------------------- SLIP step
     def _compute_slip_forces(
@@ -76,94 +68,57 @@ class PhysicsEngine:
         takeoff_theta_tol: float,
     ):
         """
-        Compute contact forces using the SLIP model.
-        Returns (F_act_x, F_act_y, F_spring_x, F_spring_y, touching, l_curr, dl).
+        Compute stance-mode scalar leg force and contact events.
+        State convention here is foot coordinates: q=[x_f, y_f, theta, l].
+        Returns (F_leg, touching, touchdown_event).
         """
-        x, y = q[0], q[1]
-        theta = q[2]
-        dx, dy = dq[0], dq[1]
-        s, c = math.sin(theta), math.cos(theta)
-
-        foot_y_virt = y - self.cfg.leg_length * c
-        foot_x_virt = x + self.cfg.leg_length * s
+        y_f = float(q[1])
+        theta = float(q[2])
+        l_curr = float(q[3])
+        dl = float(dq[3])
 
         touchdown_event = False
 
-        # Touchdown detection with landing-attitude clamp
-        if (not self.stance_active) and (foot_y_virt <= self.cfg.ground_y):
+        # Touchdown in foot coordinates: directly check foot height.
+        if (not self.stance_active) and (y_f <= self.cfg.ground_y):
             touchdown_event = True
             theta_td = min(theta, landing_theta_target)
             q[2] = theta_td
             dq[2] = 0.0
-            theta = theta_td
-            s, c = math.sin(theta), math.cos(theta)
-            foot_x_virt = x + self.cfg.leg_length * s
-            
-            # Enforce no-slip constraint at touchdown to prevent ground sliding
-            self._project_no_slip_velocity(q, dq)
 
-            # Touchdown constraint:
-            # 1) bottom contact point is exactly on ground (y = ground_y)
-            # 2) optional translational velocity reset (configurable)
-            q[0] = foot_x_virt - self.cfg.leg_length * s
-            q[1] = self.cfg.ground_y + self.cfg.leg_length * c
+            # Pin foot exactly on ground and remove slip velocity.
+            q[1] = self.cfg.ground_y
+            self._project_no_slip_velocity(q, dq)
+            self.stance_active = True
+            theta = theta_td
+
             if self.cfg.touchdown_zero_xy_velocity:
                 dq[0] = 0.0
                 dq[1] = 0.0
 
-            # Refresh local state for force computation after projection
-            x, y = q[0], q[1]
-            dx, dy = dq[0], dq[1]
-            foot_x_virt = x + self.cfg.leg_length * s
-            foot_y_virt = y - self.cfg.leg_length * c
-
-            self.stance_active = True
-            self.stance_foot_anchor = np.array(
-                [foot_x_virt, self.cfg.ground_y], dtype=np.float64
-            )
-
-        F_act_x = -F_total * s
-        F_act_y = F_total * c
-        F_spring_x, F_spring_y = 0.0, 0.0
+        F_leg = float(F_total)
         touching = False
-        l_curr = self.cfg.leg_length
-        dl = 0.0
 
         if self.stance_active:
             touching = True
-            r_x = x - self.stance_foot_anchor[0]
-            r_y = y - self.stance_foot_anchor[1]
-            l_curr = max(math.sqrt(r_x ** 2 + r_y ** 2), 1e-6)
 
-            e_x, e_y = r_x / l_curr, r_y / l_curr
-            dl = dx * e_x + dy * e_y
-
-            # Thrust along leg axis (SLIP actuation)
-            F_act_x = F_total * e_x
-            F_act_y = F_total * e_y
-
-            compression = float(np.clip(self.cfg.leg_length - l_curr, 0.0, self.cfg.stroke_length))
+            compression = float(
+                np.clip(self.cfg.leg_length - l_curr, 0.0, self.cfg.stroke_length)
+            )
             if compression > 0.0:
                 F_mag = self.cfg.k_slip * compression - self.cfg.c_slip * dl
                 F_mag = max(0.0, F_mag)
-                F_spring_x = F_mag * e_x
-                F_spring_y = F_mag * e_y
+                F_leg += F_mag
 
             # Liftoff condition
-            theta_leg = math.atan2(-r_x, r_y)
-            theta_err_takeoff = abs(self.wrap_angle(theta_leg - takeoff_theta_target))
+            theta_err_takeoff = abs(self.wrap_angle(theta - takeoff_theta_target))
             reached_takeoff = theta_err_takeoff <= takeoff_theta_tol
             over_extended = l_curr >= self.cfg.leg_length + 0.05 * self.cfg.stroke_length
             natural_liftoff = (l_curr >= self.cfg.leg_length) and (dl > 0.0) and reached_takeoff
             if natural_liftoff or over_extended:
                 self.stance_active = False
-        
-        # Hard no-slip constraint: during stance, foot must not slide
-        # This is enforced by the stance anchor and contact dynamics
-        # but we reinforce it here to prevent numerical drift.
-        # (The velocity projection happens in _apply_stance_correction after integration.)
 
-        return F_act_x, F_act_y, F_spring_x, F_spring_y, touching, l_curr, dl, touchdown_event
+        return F_leg, touching, touchdown_event
 
     # --------------------------------------------------- legacy spring-damper
     def _compute_legacy_forces(
@@ -219,6 +174,7 @@ class PhysicsEngine:
         k = self.cfg.eom_leg_k
         b = self.cfg.eom_leg_damping
 
+        # M, B, G, F constructed according to `jumping_robot_dynamics_v3.py` matrices where (x,y) is foot
         M = np.array([
             [m1 + m2, 0.0, l * m1 * cth, m1 * sth],
             [0.0, m1 + m2, -l * m1 * sth, m1 * cth],
@@ -227,17 +183,17 @@ class PhysicsEngine:
         ], dtype=np.float64)
 
         B = np.array([
-            dtheta * m1 * (2.0 * dl * cth - dtheta * l * sth),
-            -dtheta * m1 * (2.0 * dl * sth + dtheta * l * cth),
-            -2.0 * m1 * (dl * dy * sth - dl * dx * cth - dl * dtheta * l + dtheta * dy * l * cth + dtheta * dx * l * sth),
-            b * dl + (dtheta ** 2) * l * m1 + 2.0 * dtheta * dx * m1 * cth - 2.0 * dtheta * dy * m1 * sth,
+            - m1 * (dtheta ** 2) * l * sth,
+            - m1 * (dtheta ** 2) * l * cth,
+            - 2.0 * m1 * l * dtheta * (dy * cth + dx * sth),
+            (theta ** 2) * l * m1 + 2 * dtheta * dx * m1 * cth - 2 * dtheta * dy * m1 * sth,
         ], dtype=np.float64)
 
         G = np.array([
             0.0,
             (m1 + m2) * g,
-            -g * l * m1 * sth,
-            k * (l - self.cfg.leg_length) + m1 * g * cth,
+            - g * l * m1 * sth,
+            m1 * g * cth,
         ], dtype=np.float64)
 
         F = np.array([
@@ -287,21 +243,22 @@ class PhysicsEngine:
 
         # Compute contact forces
         if self.cfg.use_slip_stance:
-            F_act_x, F_act_y, F_sx, F_sy, touching, l_curr, dl, touchdown_event = (
-                self._compute_slip_forces(
-                    q,
-                    dq,
-                    F_total,
-                    landing_theta_target,
-                    takeoff_theta_target,
-                    takeoff_theta_tol,
-                )
+            F_leg, touching, touchdown_event = self._compute_slip_forces(
+                q,
+                dq,
+                F_total,
+                landing_theta_target,
+                takeoff_theta_target,
+                takeoff_theta_tol,
             )
         else:
             touchdown_event = False
-            F_act_x, F_act_y, F_sx, F_sy, touching, l_curr, dl = (
-                self._compute_legacy_forces(q, dq, F_total)
-            )
+            # F_act_x, F_act_y, F_sx, F_sy, touching, l_curr, dl = (
+            #     self._compute_legacy_forces(q, dq, F_total)
+            # )
+            # Legacy forces removed for clarity since q is now Foot coordinate.
+            F_leg = F_total
+            touching = False
 
         # Flight-phase attitude assist (PD torque) to suppress aerial somersaults
         tau_att = 0.0
@@ -323,59 +280,45 @@ class PhysicsEngine:
             q[3] += dq[3] * self.cfg.dt
             q[3] = float(np.clip(q[3], self.cfg.leg_min_length, self.cfg.leg_length + self.cfg.stroke_length))
         else:
-            ddx = (F_act_x + F_sx) / self.cfg.mass
-            ddy = (F_act_y + F_sy) / self.cfg.mass - self.cfg.gravity
-            ddtheta = 0.0 if self.stance_active else (tau + tau_att) / self.cfg.inertia
-
-            dq[0] += ddx * self.cfg.dt
-            dq[1] += ddy * self.cfg.dt
+            # Stance integration using polar generalized coordinates relative to foot
+            m = self.cfg.mass
+            I = self.cfg.inertia
+            g = self.cfg.gravity
+            theta = q[2]
+            dtheta = dq[2]
+            l = q[3]
+            dl = dq[3]
+            s, c = math.sin(theta), math.cos(theta)
+            
+            ddl = F_leg / m - g * c + l * (dtheta ** 2)
+            ddtheta = (tau + tau_att + m * g * l * s - 2 * m * l * dl * dtheta) / (I + m * (l ** 2))
+            
+            # Foot is mathematically anchored exactly at the contact point.
+            dq[0] = 0.0
+            dq[1] = 0.0
             dq[2] += ddtheta * self.cfg.dt
-            q[0] += dq[0] * self.cfg.dt
-            q[1] += dq[1] * self.cfg.dt
+            dq[3] += ddl * self.cfg.dt
             q[2] += dq[2] * self.cfg.dt
+            q[3] += dq[3] * self.cfg.dt
 
-            # Optional touchdown translational speed clamp.
+            # Keep stance foot exactly pinned to ground in foot-coordinate model.
+            q[1] = self.cfg.ground_y
+
+            # Prevent unbounded visual/body stretching during stance.
+            l_min = self.cfg.leg_min_length
+            l_max = self.cfg.leg_length + self.cfg.stroke_length
+            q[3] = float(np.clip(q[3], l_min, l_max))
+            if (q[3] <= l_min and dq[3] < 0.0) or (q[3] >= l_max and dq[3] > 0.0):
+                dq[3] = 0.0
+
+            # Optional touchdown translational velocity reset (emulated on rotational state).
             if touchdown_event and self.cfg.touchdown_zero_xy_velocity:
-                dq[0] = 0.0
-                dq[1] = 0.0
+                dq[2] = 0.0
+                dq[3] = 0.0
 
-        # Stance post-correction: lock geometry to anchor
-        if self.cfg.use_slip_stance and self.stance_active:
-            self._apply_stance_correction(q, dq)
-
-        # Update leg state in q/dq
-        if self.stance_active:
-            # For SLIP stance, q[3]/dq[3] are already refreshed in
-            # _apply_stance_correction using current post-integration state.
-            # Avoid overwriting them with stale pre-integration (l_curr, dl).
-            if not self.cfg.use_slip_stance:
-                q[3] = l_curr
-                dq[3] = dl
-        elif not self.cfg.use_flight_eom:
+        # Leg state is managed explicitly above.
+        if not self.stance_active and not self.cfg.use_flight_eom:
             q[3] = self.cfg.leg_length
             dq[3] = 0.0
 
         return touching
-
-    def _apply_stance_correction(
-        self, q: np.ndarray, dq: np.ndarray
-    ):
-        """
-        Enforce geometric consistency of body orientation during SLIP stance.
-        Prevents visual/numeric body deformation.
-        """
-        theta_prev = q[2]
-        theta_stance, l_curr = self.stance_theta_from_anchor(q)
-        q[2]  = theta_stance
-        q[3]  = l_curr
-        dq[2] = self.wrap_angle(theta_stance - theta_prev) / self.cfg.dt
-
-        r_x = q[0] - self.stance_foot_anchor[0]
-        r_y = q[1] - self.stance_foot_anchor[1]
-        l_curr = max(math.sqrt(r_x ** 2 + r_y ** 2), 1e-6)
-        e_x, e_y = r_x / l_curr, r_y / l_curr
-        dq[3] = dq[0] * e_x + dq[1] * e_y
-
-        # No-slip foot constraint (high friction assumption):
-        # d/dt(x + l sinθ)=0, d/dt(y - l cosθ)=0
-        self._project_no_slip_velocity(q, dq)

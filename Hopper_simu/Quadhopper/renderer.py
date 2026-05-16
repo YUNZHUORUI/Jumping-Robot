@@ -70,11 +70,11 @@ class QuadhopperRenderer:
             ax.plot(tx_arr[mask], ty_arr[mask], 'r--', alpha=0.5)
 
         # Robot body & leg
-        x, y, theta = obs[0], obs[1], obs[2]
-        foot_pos = env.get_foot_pos()
+        foot_x, foot_y, theta, l_curr = obs[0], obs[1], obs[2], obs[3]
+        foot_pos = np.array([foot_x, foot_y], dtype=np.float64)
 
         render_scale = cfg.render_geom_scale
-        com = np.array([x, y], dtype=np.float64)
+        com = env.physics.get_com_pos(obs[:4])
         leg_vec = np.array(foot_pos, dtype=np.float64) - com
         leg_len = float(np.linalg.norm(leg_vec))
         if leg_len > 1e-8:
@@ -110,9 +110,10 @@ class QuadhopperRenderer:
         ax.scatter(body_l[0], body_l[1], s=cfg.render_rotor_size, c=[rotor_l_color], edgecolors='k', linewidths=0.8, zorder=5)
         ax.scatter(body_r[0], body_r[1], s=cfg.render_rotor_size, c=[rotor_r_color], edgecolors='k', linewidths=0.8, zorder=5)
 
-        ax.plot([x, render_foot[0]], [y, render_foot[1]], 'b-', lw=cfg.leg_linewidth)
+        ax.plot([com[0], render_foot[0]], [com[1], render_foot[1]], 'b-', lw=cfg.leg_linewidth)
         ax.plot(render_foot[0], render_foot[1], 'ro', markersize=cfg.foot_markersize)
 
+        cx = com[0]
         ax.text(
             cx - cfg.view_x_behind + 0.5,
             cfg.view_y_max - 0.5,
