@@ -13,6 +13,7 @@ env/
 
 # ===== OS / Editor =====
 .DS_Store
+._*
 Thumbs.db
 .idea/
 .vscode/
@@ -62,8 +63,9 @@ events.out.tfevents.*
 debug_*.png
 *_debug.png
 
-# 例外：README 引用的展示文件保留
-!Adobe Express - PixPin_2026-02-06_00-07-40.gif
+# 例外：docs/ 下的展示文件保留（README 引用）
+!docs/images/*.gif
+!docs/images/*.png
 
 # ===== Isaac Sim 特定 =====
 Hopper-sim-Isaac/logs/
