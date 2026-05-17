@@ -42,8 +42,23 @@ class HopperEnvCfg(DirectRLEnvCfg):
     # XY 水平速度阻尼：抑制漂移
     xy_vel_penalty_scale = -0.5
 
-    # 超过此高度视为"飞走"而非"跳跃"，episode 终止
-    max_hop_height: float = 0.4   # m
+    # ── 跳高课程化 reward（fine-tune 用：保留 baseline 风格，只多给"往上"信号）─
+    # dense：Gauss(本次起跳 peak_z - target)，奖励峰值匹配目标（而非"穿过 target 的速度"）
+    height_target_scale  =  3.0
+    # sparse：落地瞬间 Gauss(peak_z - target) × exp(-tilt × k)，每个弹跳循环只发一次
+    # 这是"完成弹跳"的强信号，让弹跳总收益 ≫ 单次悬停
+    touchdown_bonus_scale = 8.0
+    # 落地姿态因子：tilt 越大砍掉越多 bonus → 强制竖直落地，防止角动量累积翻倒
+    landing_upright_k: float = 20.0
+    # 目标跳跃高度（m）。curriculum：从能稳定跳的 0.4m → 0.6 → 0.8 → 1.0
+    target_hop_height: float = 0.6
+    # Gauss σ：σ=0.15 时 0.4m 拿 41%，0.5m 拿 80%，0.6m 拿 100% —— 有明显往上的梯度
+    height_target_sigma: float = 0.15
+
+    # 超过此高度视为"飞走"而非"跳跃"，episode 终止（留 0.4m 过冲余量给探索）
+    max_hop_height: float = 1.0   # m
+    # 防悬停：连续离地超过此时长 → episode 死亡（0.6m 弹道 ≈ 0.7s，1.0s 够用）
+    max_airborne_time_s: float = 1.0
 
     # ── 物理 ─────────────────────────────────
     sim: SimulationCfg = SimulationCfg(
@@ -114,10 +129,18 @@ class HopperEnv(DirectRLEnv):
         body_ids, _ = self._robot.find_bodies("body")
         self._body_id = body_ids[0:1]
 
+        # 弹跳跟踪：本次起跳达到的最高 z，贴地复位；上一步是否贴地（用于落地边沿检测）
+        self._peak_z_since_touch = torch.zeros(self.num_envs, device=self.device)
+        self._was_on_ground_prev = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
+        # 防悬停：连续离地步数
+        self._airborne_steps = torch.zeros(self.num_envs, dtype=torch.long, device=self.device)
+        self._max_airborne_steps = int(self.cfg.max_airborne_time_s / self._dt_policy)
+
         self._episode_sums = {
             k: torch.zeros(self.num_envs, dtype=torch.float, device=self.device)
             for k in ["survival", "hop_velocity", "ground_bonus", "upright",
-                      "action_rate", "action_smooth", "xy_pos", "xy_vel"]
+                      "action_rate", "action_smooth", "xy_pos", "xy_vel",
+                      "height_target", "touchdown_bonus"]
         }
 
     def _setup_scene(self):
@@ -222,6 +245,39 @@ class HopperEnv(DirectRLEnv):
         vxy = self._robot.data.root_lin_vel_w[:, :2]
         xy_vel = torch.sum(vxy ** 2, dim=1)
 
+        # 6. 跳高目标 reward —— 基于"本次起跳的峰值"，不基于当前 z 或 vz
+        #    避免"快速穿过 target"得分高于"弹道顶到 target"那个数学陷阱
+        sigma = self.cfg.height_target_sigma
+        target = self.cfg.target_hop_height
+        on_ground_now = z < 0.08
+        just_touched = on_ground_now & (~self._was_on_ground_prev)
+        valid_hop = self._peak_z_since_touch > 0.15  # 过滤贴地震荡和初始下落
+
+        peak_match = torch.exp(
+            -((self._peak_z_since_touch - target) ** 2) / (2.0 * sigma * sigma)
+        )
+        # 落地系数：tilt 越大砍掉越多（k=20 时 25° 倾斜砍 60%，45° 砍 95%）
+        upright_factor = torch.exp(-tilt * self.cfg.landing_upright_k)
+        # 落地 bonus：先算（在 peak_z 复位前），只在"刚刚落地 且 这次有效起跳"时给
+        touchdown_bonus = torch.where(
+            just_touched & valid_hop,
+            peak_match * upright_factor,
+            torch.zeros_like(peak_match),
+        )
+
+        # 更新峰值跟踪：贴地复位为 0，否则取 max(peak, z)
+        self._peak_z_since_touch = torch.where(
+            on_ground_now,
+            torch.zeros_like(self._peak_z_since_touch),
+            torch.maximum(self._peak_z_since_touch, z),
+        )
+        self._was_on_ground_prev = on_ground_now
+
+        # dense：每步基于更新后的 peak_z 给 Gauss 奖励（贴地段 ≈ 0，apex 处 = 1）
+        height_target = torch.exp(
+            -((self._peak_z_since_touch - target) ** 2) / (2.0 * sigma * sigma)
+        )
+
         rewards = {
             "survival":      torch.ones(self.num_envs, device=self.device) * self.cfg.survival_scale * self.step_dt,
             "hop_velocity":  hop_velocity  * self.cfg.hop_velocity_scale  * self.step_dt,
@@ -231,6 +287,9 @@ class HopperEnv(DirectRLEnv):
             "action_smooth": action_smooth * self.cfg.action_smooth_scale * self.step_dt,
             "xy_pos":        xy_pos        * self.cfg.xy_pos_reward_scale * self.step_dt,
             "xy_vel":        xy_vel        * self.cfg.xy_vel_penalty_scale * self.step_dt,
+            "height_target": height_target * self.cfg.height_target_scale * self.step_dt,
+            # 落地 bonus 是离散事件，不乘 step_dt（每次触地给完整奖励）
+            "touchdown_bonus": touchdown_bonus * self.cfg.touchdown_bonus_scale,
         }
 
         reward = torch.sum(torch.stack(list(rewards.values())), dim=0)
@@ -243,8 +302,18 @@ class HopperEnv(DirectRLEnv):
         q = self._robot.data.root_quat_w
         z = self._robot.data.root_pos_w[:, 2]
         tilt = torch.sum(q[:, 1:3] ** 2, dim=1)
-        # 翻倒 或 飞出弹跳区间（超过max_hop_height视为飞走而非弹跳）
-        died = torch.logical_or(tilt > 0.5, z > self.cfg.max_hop_height)
+
+        # 累计连续离地步数：贴地复位，否则 +1
+        on_ground = z < 0.08
+        self._airborne_steps = torch.where(
+            on_ground,
+            torch.zeros_like(self._airborne_steps),
+            self._airborne_steps + 1,
+        )
+        hovering_too_long = self._airborne_steps > self._max_airborne_steps
+
+        # 翻倒 / 飞出弹跳区间 / 长时间盘旋 → died
+        died = (tilt > 0.5) | (z > self.cfg.max_hop_height) | hovering_too_long
         return died, time_out
 
     def _reset_idx(self, env_ids: torch.Tensor | None):
@@ -272,6 +341,9 @@ class HopperEnv(DirectRLEnv):
 
         self._actions[env_ids] = 0.0
         self._motor_u[env_ids] = 0.0
+        self._peak_z_since_touch[env_ids] = 0.0
+        self._was_on_ground_prev[env_ids] = False
+        self._airborne_steps[env_ids] = 0
         for i in range(len(self._action_history)):
             self._action_history[i][env_ids] = 0.0
 

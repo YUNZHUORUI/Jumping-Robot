@@ -9,6 +9,10 @@ print("[DEBUG 2] AppLauncher imported", flush=True)
 
 parser = argparse.ArgumentParser(description="Train MyQuadcopter with RSL-RL PPO")
 parser.add_argument("--num_envs", type=int, default=256, help="Number of parallel environments")
+parser.add_argument("--resume", action="store_true",
+                    help="Resume from latest checkpoint (or --checkpoint if given)")
+parser.add_argument("--checkpoint", type=str, default=None,
+                    help="Specific checkpoint .pt to resume from; ignored unless --resume")
 AppLauncher.add_app_launcher_args(parser)
 args_cli = parser.parse_args()
 
@@ -49,6 +53,21 @@ from Quadhopper_Isaac.my_hopper_env import HopperEnvCfg
 from Quadhopper_Isaac.rsl_rl_ppo_cfg import HopperPPORunnerCfg
 
 
+def find_latest_checkpoint():
+    """Return path to newest model_*.pt under logs/rsl_rl/myhopper/, or None."""
+    log_root = os.path.join(os.path.dirname(__file__), "logs", "rsl_rl", "myhopper")
+    if not os.path.exists(log_root):
+        return None
+    runs = sorted(os.listdir(log_root))
+    for run in reversed(runs):
+        run_path = os.path.join(log_root, run)
+        pts = [f for f in os.listdir(run_path) if f.startswith("model_") and f.endswith(".pt")]
+        if pts:
+            pts.sort(key=lambda x: int(x.replace("model_", "").replace(".pt", "")))
+            return os.path.join(run_path, pts[-1])
+    return None
+
+
 def main():
     env_cfg = HopperEnvCfg()
     env_cfg.scene.num_envs = args_cli.num_envs
@@ -65,6 +84,15 @@ def main():
     os.makedirs(log_dir, exist_ok=True)
 
     runner = OnPolicyRunner(env, runner_cfg.to_dict(), log_dir=log_dir, device="cuda:0")
+
+    if args_cli.resume:
+        checkpoint = args_cli.checkpoint or find_latest_checkpoint()
+        if checkpoint is None:
+            print("[WARN] --resume given but no checkpoint found; starting from scratch")
+        else:
+            print(f"[INFO] Resuming from checkpoint: {checkpoint}")
+            runner.load(checkpoint)
+
     runner.learn(num_learning_iterations=runner_cfg.max_iterations, init_at_random_ep_len=True)
 
     env.close()
