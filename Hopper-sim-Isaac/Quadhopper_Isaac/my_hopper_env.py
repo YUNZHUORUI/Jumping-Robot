@@ -228,8 +228,10 @@ class HopperEnv(DirectRLEnv):
         ground_proximity = torch.exp(-z * 10.0)
         hop_velocity = torch.relu(vz) * ground_proximity
 
-        # 2. 落地奖励：在很低位置（弹跳触地阶段）给小额奖励，鼓励弹回地面
-        on_ground = (z < 0.08).float()
+        # 2. 落地奖励：腿触地时给小额奖励
+        # 注意：腿长 ~0.12m → body z 在 leg 触地时 ≈ 0.126m，所以阈值要 > 0.12
+        # （baseline 用 0.08 但靠 hop_velocity 的 exp(-z*10) 平滑信号弹跳，这里我们需要硬触发边沿）
+        on_ground = (z < 0.15).float()
 
         # 3. 竖直稳定惩罚
         tilt = torch.sum(q[:, 1:3] ** 2, dim=1)
@@ -249,9 +251,9 @@ class HopperEnv(DirectRLEnv):
         #    避免"快速穿过 target"得分高于"弹道顶到 target"那个数学陷阱
         sigma = self.cfg.height_target_sigma
         target = self.cfg.target_hop_height
-        on_ground_now = z < 0.08
+        on_ground_now = z < 0.15  # body z when leg touches ground ≈ 0.126m
         just_touched = on_ground_now & (~self._was_on_ground_prev)
-        valid_hop = self._peak_z_since_touch > 0.15  # 过滤贴地震荡和初始下落
+        valid_hop = self._peak_z_since_touch > 0.25  # 必须真的离地一段，过滤贴地震荡
 
         peak_match = torch.exp(
             -((self._peak_z_since_touch - target) ** 2) / (2.0 * sigma * sigma)
@@ -303,8 +305,8 @@ class HopperEnv(DirectRLEnv):
         z = self._robot.data.root_pos_w[:, 2]
         tilt = torch.sum(q[:, 1:3] ** 2, dim=1)
 
-        # 累计连续离地步数：贴地复位，否则 +1
-        on_ground = z < 0.08
+        # 累计连续离地步数：贴地复位，否则 +1（阈值同 _get_rewards）
+        on_ground = z < 0.15
         self._airborne_steps = torch.where(
             on_ground,
             torch.zeros_like(self._airborne_steps),
