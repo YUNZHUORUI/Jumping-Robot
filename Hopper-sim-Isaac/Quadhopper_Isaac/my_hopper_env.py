@@ -44,16 +44,18 @@ class HopperEnvCfg(DirectRLEnvCfg):
 
     # ── 跳高课程化 reward（fine-tune 用：保留 baseline 风格，只多给"往上"信号）─
     # dense：Gauss(本次起跳 peak_z - target)，奖励峰值匹配目标（而非"穿过 target 的速度"）
-    height_target_scale  =  3.0
+    height_target_scale  =  5.0
     # sparse：落地瞬间 Gauss(peak_z - target) × exp(-tilt × k)，每个弹跳循环只发一次
     # 这是"完成弹跳"的强信号，让弹跳总收益 ≫ 单次悬停
-    touchdown_bonus_scale = 8.0
+    # 15（原 8）：让 0.3m 小跳和 0.5m 大跳的 bonus 差距从 1:6 拉到 1:16
+    touchdown_bonus_scale = 15.0
     # 落地姿态因子：tilt 越大砍掉越多 bonus → 强制竖直落地，防止角动量累积翻倒
     landing_upright_k: float = 20.0
     # 目标跳跃高度（m）。curriculum：从能稳定跳的 0.4m → 0.6 → 0.8 → 1.0
     target_hop_height: float = 0.6
-    # Gauss σ：σ=0.15 时 0.4m 拿 41%，0.5m 拿 80%，0.6m 拿 100% —— 有明显往上的梯度
-    height_target_sigma: float = 0.15
+    # σ：σ=0.12 时 0.3m 拿 4.4%，0.4m 拿 25%，0.5m 拿 71%，0.6m 拿 100%
+    # —— 收窄比 0.15 的版本在小跳区间惩罚更狠，policy 必须往上推才有显著收益
+    height_target_sigma: float = 0.12
 
     # 超过此高度视为"飞走"而非"跳跃"，episode 终止（留 0.4m 过冲余量给探索）
     max_hop_height: float = 1.0   # m
