@@ -53,9 +53,9 @@ class HopperEnvCfg(DirectRLEnvCfg):
     landing_upright_k: float = 20.0
     # 目标跳跃高度（m）。curriculum：从能稳定跳的 0.4m → 0.6 → 0.8 → 1.0
     target_hop_height: float = 0.6
-    # σ：σ=0.12 时 0.3m 拿 4.4%，0.4m 拿 25%，0.5m 拿 71%，0.6m 拿 100%
-    # —— 收窄比 0.15 的版本在小跳区间惩罚更狠，policy 必须往上推才有显著收益
-    height_target_sigma: float = 0.12
+    # σ：σ=0.20 时 0.14m(自然反弹) 拿 7%，0.2m 拿 14%，0.3m 拿 49%，0.6m 拿 100%
+    # —— σ=0.12 太窄，policy 在 0.14m 处梯度几乎消失（Gauss<0.001），看不见 target
+    height_target_sigma: float = 0.20
 
     # 超过此高度视为"飞走"而非"跳跃"，episode 终止（留 0.4m 过冲余量给探索）
     max_hop_height: float = 1.0   # m
@@ -231,9 +231,9 @@ class HopperEnv(DirectRLEnv):
         hop_velocity = torch.relu(vz) * ground_proximity
 
         # 2. 落地奖励：腿触地时给小额奖励
-        # 注意：腿长 ~0.12m → body z 在 leg 触地时 ≈ 0.126m，所以阈值要 > 0.12
-        # （baseline 用 0.08 但靠 hop_velocity 的 exp(-z*10) 平滑信号弹跳，这里我们需要硬触发边沿）
-        on_ground = (z < 0.15).float()
+        # 注意：腿长 ~0.12m → body z 在 leg 触地时 ≈ 0.126m
+        # 阈值 0.13：刚好在 rest 之上一点，自然反弹（peak ≈ 0.14m）也能触发 airborne 边沿
+        on_ground = (z < 0.13).float()
 
         # 3. 竖直稳定惩罚
         tilt = torch.sum(q[:, 1:3] ** 2, dim=1)
@@ -253,18 +253,19 @@ class HopperEnv(DirectRLEnv):
         #    避免"快速穿过 target"得分高于"弹道顶到 target"那个数学陷阱
         sigma = self.cfg.height_target_sigma
         target = self.cfg.target_hop_height
-        on_ground_now = z < 0.15  # body z when leg touches ground ≈ 0.126m
+        on_ground_now = z < 0.13  # body z when leg touches ground ≈ 0.126m
         just_touched = on_ground_now & (~self._was_on_ground_prev)
-        valid_hop = self._peak_z_since_touch > 0.25  # 必须真的离地一段，过滤贴地震荡
+        # 不再用 valid_hop 阈值过滤 —— Gauss σ=0.20 已经让小幅度 hop 的 bonus 很小
+        # （0.14m peak → bonus ≈ 1，0.30m → 7，0.60m → 15）有清晰梯度往上爬
 
         peak_match = torch.exp(
             -((self._peak_z_since_touch - target) ** 2) / (2.0 * sigma * sigma)
         )
         # 落地系数：tilt 越大砍掉越多（k=20 时 25° 倾斜砍 60%，45° 砍 95%）
         upright_factor = torch.exp(-tilt * self.cfg.landing_upright_k)
-        # 落地 bonus：先算（在 peak_z 复位前），只在"刚刚落地 且 这次有效起跳"时给
+        # 落地 bonus：先算（在 peak_z 复位前），只在"刚刚落地"时给
         touchdown_bonus = torch.where(
-            just_touched & valid_hop,
+            just_touched,
             peak_match * upright_factor,
             torch.zeros_like(peak_match),
         )
@@ -308,7 +309,7 @@ class HopperEnv(DirectRLEnv):
         tilt = torch.sum(q[:, 1:3] ** 2, dim=1)
 
         # 累计连续离地步数：贴地复位，否则 +1（阈值同 _get_rewards）
-        on_ground = z < 0.15
+        on_ground = z < 0.13
         self._airborne_steps = torch.where(
             on_ground,
             torch.zeros_like(self._airborne_steps),
