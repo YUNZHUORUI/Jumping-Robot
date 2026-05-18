@@ -30,8 +30,11 @@ class HopperEnvCfg(DirectRLEnvCfg):
     hop_velocity_scale   =  8.0
     # 在地面附近的额外奖励（鼓励弹回地面）
     ground_bonus_scale   =  2.0
-    # 竖直稳定：倾斜角越小越好
-    upright_scale        = -6.0
+    # 竖直稳定：倾斜角越小越好（sin²(θ/2)）
+    upright_scale        = -10.0
+    # 角速度阻尼：抑制空中旋转 —— Ixx≈8.4e-4，0.1N推力差就能 100ms 内转 30°，
+    # 没这一项的话 policy 推力一发力姿态就发散，所有 env 都翻倒
+    ang_vel_penalty_scale = -0.05
     # 生存奖励
     survival_scale       =  0.5
     # 动作平滑
@@ -141,8 +144,8 @@ class HopperEnv(DirectRLEnv):
         self._episode_sums = {
             k: torch.zeros(self.num_envs, dtype=torch.float, device=self.device)
             for k in ["survival", "hop_velocity", "ground_bonus", "upright",
-                      "action_rate", "action_smooth", "xy_pos", "xy_vel",
-                      "height_target", "touchdown_bonus"]
+                      "ang_vel", "action_rate", "action_smooth", "xy_pos",
+                      "xy_vel", "height_target", "touchdown_bonus"]
         }
 
     def _setup_scene(self):
@@ -235,8 +238,10 @@ class HopperEnv(DirectRLEnv):
         # 阈值 0.13：刚好在 rest 之上一点，自然反弹（peak ≈ 0.14m）也能触发 airborne 边沿
         on_ground = (z < 0.13).float()
 
-        # 3. 竖直稳定惩罚
+        # 3. 竖直稳定惩罚 + 角速度阻尼
         tilt = torch.sum(q[:, 1:3] ** 2, dim=1)
+        ang_vel_b = self._robot.data.root_ang_vel_b
+        ang_vel_sq = torch.sum(ang_vel_b ** 2, dim=1)
 
         # 4. 动作平滑
         action_rate   = torch.sum(torch.square(self._actions - self._prev_actions), dim=1)
@@ -288,6 +293,7 @@ class HopperEnv(DirectRLEnv):
             "hop_velocity":  hop_velocity  * self.cfg.hop_velocity_scale  * self.step_dt,
             "ground_bonus":  on_ground     * self.cfg.ground_bonus_scale  * self.step_dt,
             "upright":       tilt          * self.cfg.upright_scale       * self.step_dt,
+            "ang_vel":       ang_vel_sq    * self.cfg.ang_vel_penalty_scale * self.step_dt,
             "action_rate":   action_rate   * self.cfg.action_rate_scale   * self.step_dt,
             "action_smooth": action_smooth * self.cfg.action_smooth_scale * self.step_dt,
             "xy_pos":        xy_pos        * self.cfg.xy_pos_reward_scale * self.step_dt,
