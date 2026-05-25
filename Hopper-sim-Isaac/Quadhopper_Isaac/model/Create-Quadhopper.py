@@ -13,8 +13,8 @@ import omni.usd
 from pxr import UsdGeom, UsdPhysics, Gf, PhysxSchema, Sdf
 
 CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
-STL_BASE = os.path.join(CURRENT_DIR, "..", "Jump+Base.stl")
-STL_LEG  = os.path.join(CURRENT_DIR, "..", "Jump+Leg.stl")
+STL_BASE = os.path.join(CURRENT_DIR, "Jump+Base.stl")
+STL_LEG  = os.path.join(CURRENT_DIR, "Jump+Leg.stl")
 USD_OUT  = os.path.join(CURRENT_DIR, "QuadhopperAsset.usd")
 
 # ══════════════════════════════════════════════════════
@@ -39,7 +39,7 @@ Z_OFFSET = -0.054 # 正 = 上移，负 = 下移（机身底面在 -0.006 m）
 #  物理参数
 # ══════════════════════════════════════════════════════
 
-DRONE_MASS    = 0.140   # 整机（机体+腿）总质量 140g
+DRONE_MASS    = 0.166   # 整机（机体+腿）总质量 166g（匹配实物）
 I_XX, I_YY, I_ZZ = 7.522172e-04, 8.657694e-04, 1.482076e-03   # 实测惯量值
 DIAGONAL_M    = 0.230
 MOTOR_OFFSET  = 0.0813
