@@ -1,0 +1,6 @@
+numpy
+scipy
+pyserial
+onnxruntime
+# Vicon DSSDK Python 绑定（不能 pip 装；从 Vicon 官网下载 DataStream SDK 安装）
+# vicon_dssdk
