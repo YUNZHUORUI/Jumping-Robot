@@ -31,8 +31,8 @@ import gymnasium as gym
 from isaaclab_rl.rsl_rl import RslRlVecEnvWrapper
 from rsl_rl.runners import OnPolicyRunner
 
-from Quadhopper_Isaac.my_hopper_env import HopperEnvCfg
-from Quadhopper_Isaac.rsl_rl_ppo_cfg import HopperPPORunnerCfg
+from Quadhopper_Isaac.quadhopper_env import QuadhopperEnvCfg
+from Quadhopper_Isaac.rsl_rl_ppo_cfg import QuadhopperPPORunnerCfg
 
 
 def find_latest_checkpoint():
@@ -58,7 +58,7 @@ def main():
         print(f"[INFO] Loading checkpoint: {checkpoint}")
 
         print("[DEBUG] Creating env config...")
-        env_cfg = HopperEnvCfg()
+        env_cfg = QuadhopperEnvCfg()
         env_cfg.scene.num_envs = args_cli.num_envs
         env_cfg.episode_length_s = 30.0
 
@@ -68,7 +68,7 @@ def main():
         env = RslRlVecEnvWrapper(env)
 
         print("[DEBUG] Creating OnPolicyRunner...")
-        runner_cfg = HopperPPORunnerCfg()
+        runner_cfg = QuadhopperPPORunnerCfg()
         runner = OnPolicyRunner(env, runner_cfg.to_dict(), log_dir=None, device="cuda:0")
         print("[DEBUG] Loading checkpoint...")
         runner.load(checkpoint)

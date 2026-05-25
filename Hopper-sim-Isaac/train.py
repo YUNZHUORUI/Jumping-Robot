@@ -49,8 +49,8 @@ from isaaclab_rl.rsl_rl import RslRlVecEnvWrapper
 from rsl_rl.runners import OnPolicyRunner
 print("[DEBUG 7] all imports done", flush=True)
 
-from Quadhopper_Isaac.my_hopper_env import HopperEnvCfg
-from Quadhopper_Isaac.rsl_rl_ppo_cfg import HopperPPORunnerCfg
+from Quadhopper_Isaac.quadhopper_env import QuadhopperEnvCfg
+from Quadhopper_Isaac.rsl_rl_ppo_cfg import QuadhopperPPORunnerCfg
 
 
 def find_latest_checkpoint():
@@ -69,13 +69,13 @@ def find_latest_checkpoint():
 
 
 def main():
-    env_cfg = HopperEnvCfg()
+    env_cfg = QuadhopperEnvCfg()
     env_cfg.scene.num_envs = args_cli.num_envs
 
     env = gym.make("myhopper", cfg=env_cfg)
     env = RslRlVecEnvWrapper(env)
 
-    runner_cfg = HopperPPORunnerCfg()
+    runner_cfg = QuadhopperPPORunnerCfg()
     log_dir = os.path.join(
         os.path.dirname(__file__),
         "logs", "rsl_rl", "myhopper",

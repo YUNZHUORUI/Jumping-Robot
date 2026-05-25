@@ -42,10 +42,10 @@ gym.register(
 
 gym.register(
     id="myhopper",
-    entry_point=f"{__name__}.my_hopper_env:HopperEnv",
+    entry_point=f"{__name__}.quadhopper_env:QuadhopperEnv",
     disable_env_checker=True,
     kwargs={
-        "env_cfg_entry_point": f"{__name__}.my_hopper_env:HopperEnvCfg",
-        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:HopperPPORunnerCfg",
+        "env_cfg_entry_point": f"{__name__}.quadhopper_env:QuadhopperEnvCfg",
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:QuadhopperPPORunnerCfg",
     },
 )

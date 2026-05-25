@@ -1,3 +1,3 @@
-from ..rsl_rl_ppo_cfg import QuadcopterPPORunnerCfg
+from ..rsl_rl_ppo_cfg import QuadhopperPPORunnerCfg
 
-__all__ = ["QuadcopterPPORunnerCfg"]
+__all__ = ["QuadhopperPPORunnerCfg"]
