@@ -21,7 +21,7 @@ pip install vicon_dssdk-*.whl
 | `COM_PORT` | 飞控串口 | `COM9` | 改成实际端口 |
 | `BAUD_RATE` | 波特率 | `115200` | 匹配飞控 |
 | `VICON_HOST` | Vicon Tracker 地址 | `localhost:801` | Tracker 在另一台机就改 IP |
-| `TARGET_X/Y/Z` | 目标位置 | `(0, 0, 0.8)` | 跳跃 apex 目标 |
+| `TARGET_X/Y/Z` | 目标位置 | `(0, 0, 0.8)` | 实机部署目标；仿真训练当前使用随机 XY 和 1.0-1.5 m Z 目标 |
 | `MAX_PWM` | 最大 PWM | `1000` | 匹配 ESC 范围 |
 | `REST_LEG_LENGTH` | 静止时 Vicon 测得 body 高度 | `0.115` m | **必须校准**：手动按住 hopper 在地面，读 vicon body z |
 
@@ -56,7 +56,7 @@ python run.py
 
 ## Sim2Real Gap 检查清单
 - [ ] `REST_LEG_LENGTH` 已用 vicon 校准
-- [ ] 电机推力曲线匹配仿真 `F = -0.9715u² + 1.2578u - 0.0577` (u≤0.64)
+- [ ] 电机推力曲线匹配仿真 `F = -0.2371u² + 0.8130u + 0.0113`
 - [ ] 电池电压充足（TWR > 1.3 才能跳起来）
 - [ ] 控制循环稳定在 100 Hz（用 time.perf_counter 验证）
 - [ ] Vicon 帧率 ≥ 100 Hz
