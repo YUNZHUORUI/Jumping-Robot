@@ -22,200 +22,275 @@ class QuadhopperTargetEnv(gym.Env):
         self.acfg = attitude_cfg
         self.ecfg = env_cfg
 
-        self.physics = PhysicsEngine(physics_cfg, attitude_cfg)
-        self.planner = TrajectoryPlanner(physics_cfg, env_cfg, attitude_cfg)
+        self.physics  = PhysicsEngine(physics_cfg)
+        self.planner  = TrajectoryPlanner(physics_cfg, env_cfg)
         self.reward_fn = RewardFunction(reward_cfg)
 
         self.action_space = spaces.Box(low=0.0, high=1.0, shape=(2,), dtype=np.float32)
-        self.observation_space = spaces.Box(low=-np.inf, high=np.inf, shape=(13,), dtype=np.float32)
+        # 13-dim observation (see _get_obs for full description)
+        self.observation_space = spaces.Box(
+            low=-np.inf, high=np.inf, shape=(13,), dtype=np.float32
+        )
 
-        self.q = np.zeros(4, dtype=np.float64)
+        self.q  = np.zeros(4, dtype=np.float64)
         self.dq = np.zeros(4, dtype=np.float64)
-        self.current_target_idx = 0
-        self.steps = 0
-        self.prev_touching = False
-        self.stance_steps = 0
-        self.airborne_steps = 0
+        self.current_target_idx      = 0
+        self.steps                   = 0
+        self.prev_touching           = False
+        self.consecutive_stance_steps = 0
 
+    # ---------------------------------------------------------------- reset
     def reset(self, seed=None, options=None):
         super().reset(seed=seed)
         rng = np.random.default_rng(seed)
+        options = options or {}
+        reset_mode = options.get("mode", self.ecfg.reset_mode)
+
+        self.physics.reset()
+        self.planner.reset()
+        self.current_target_idx       = 0
+        self.steps                    = 0
+        self.prev_touching            = False
+        self.consecutive_stance_steps = 0
+
+        landing_theta = math.radians(self.reward_fn.cfg.phi_td_target_deg)
+
+        if reset_mode == "ground":
+            init_theta = rng.uniform(
+                math.radians(self.ecfg.ground_init_theta_min_deg),
+                math.radians(self.ecfg.ground_init_theta_max_deg),
+            )
+            init_l = self.pcfg.leg_length - self.ecfg.ground_init_leg_compression
+            init_l = float(np.clip(init_l, self.pcfg.leg_min_length, self.pcfg.leg_length))
+            self.q = np.array(
+                [0.0, self.pcfg.ground_y, init_theta, init_l],
+                dtype=np.float64,
+            )
+            self.dq = np.zeros(4, dtype=np.float64)
+            self.physics.start_stance(self.q)
+            self.prev_touching = True
+            self.consecutive_stance_steps = 1
+
+            com_pos = self.physics.get_com_pos(self.q)
+            self.planner.plan(
+                com_pos[0], com_pos[1],
+                self.ecfg.targets[self.current_target_idx],
+                rng=rng,
+                landing_theta=landing_theta,
+            )
+            return self._get_obs(), {}
+
+        if reset_mode != "ballistic":
+            raise ValueError(f"Unknown reset mode: {reset_mode!r}")
 
         init_theta = rng.uniform(
             math.radians(self.ecfg.init_theta_min_deg),
             math.radians(self.ecfg.init_theta_max_deg),
         )
-        # q uses foot coordinates, so initialize foot on the ground.
-        init_foot_y = self.pcfg.ground_y
+        # 起始时足端在地面上方 1 mm，避免立刻触发触地检测
+        init_foot_y = self.pcfg.ground_y + 1e-3
 
-        self.q = np.array([0.0, init_foot_y, init_theta, self.pcfg.leg_length], dtype=np.float64)
+        self.q  = np.array([0.0, init_foot_y, init_theta, self.pcfg.leg_length], dtype=np.float64)
         self.dq = np.zeros(4, dtype=np.float64)
 
-        self.physics.reset()
-        self.planner.reset()
-        self.current_target_idx = 0
-        self.steps = 0
-        self.prev_touching = False
-        self.stance_steps = 0
-        self.airborne_steps = 0
-
         com_pos = self.physics.get_com_pos(self.q)
-        self.planner.plan(com_pos[0], com_pos[1], self.ecfg.targets[self.current_target_idx], rng=rng)
+        self.planner.plan(
+            com_pos[0], com_pos[1],
+            self.ecfg.targets[self.current_target_idx],
+            rng=rng,
+            landing_theta=landing_theta,
+        )
 
         if self.planner.valid:
             v_x_nom, v_y_nom = self.planner.get_initial_velocity()
-            v_x0 = rng.normal(v_x_nom, self.ecfg.init_vx_std)
-            v_y0 = rng.normal(v_y_nom, self.ecfg.init_vy_std)
-            vx_min = max(0.2, 0.80 * v_x_nom)
-            vx_max = max(vx_min + 1e-3, 1.20 * v_x_nom)
-            vy_min = 0.80 * v_y_nom
-            vy_max = 1.20 * v_y_nom
-            v_x0 = float(np.clip(v_x0, vx_min, vx_max))
-            v_y0 = float(np.clip(v_y0, vy_min, vy_max))
+            v_x0 = float(np.clip(rng.normal(v_x_nom, self.ecfg.init_vx_std),
+                                  0.80 * v_x_nom, 1.20 * v_x_nom))
+            v_y0 = float(np.clip(rng.normal(v_y_nom, self.ecfg.init_vy_std),
+                                  0.80 * v_y_nom, 1.20 * v_y_nom))
+            # 小幅向标称值回归，减少初始随机噪声
             v_x0 = 0.92 * v_x_nom + 0.08 * v_x0
             v_y0 = 0.92 * v_y_nom + 0.08 * v_y0
-            dtheta0 = float(
-                rng.uniform(
-                    math.radians(self.ecfg.init_dtheta_min_deg),
-                    math.radians(self.ecfg.init_dtheta_max_deg),
-                )
-            )
-            self.dq = np.array([v_x0, v_y0, dtheta0, 0.0], dtype=np.float64)
         else:
             v_x0 = float(rng.uniform(self.ecfg.init_vx_range[0], self.ecfg.init_vx_range[1]))
             v_y0 = float(rng.uniform(self.ecfg.init_vy_range[0], self.ecfg.init_vy_range[1]))
-            dtheta0 = float(
-                rng.uniform(
-                    math.radians(self.ecfg.init_dtheta_min_deg),
-                    math.radians(self.ecfg.init_dtheta_max_deg),
-                )
-            )
-            self.dq = np.array([v_x0, v_y0, dtheta0, 0.0], dtype=np.float64)
+
+        dtheta0 = float(rng.uniform(
+            math.radians(self.ecfg.init_dtheta_min_deg),
+            math.radians(self.ecfg.init_dtheta_max_deg),
+        ))
+        self.dq = np.array([v_x0, v_y0, dtheta0, 0.0], dtype=np.float64)
 
         return self._get_obs(), {}
 
+    # -------------------------------------------------------- helpers
     def get_foot_pos(self):
         return self.physics.get_foot_pos(self.q)
 
     def get_trajectory_state(self, x_current: float):
+        """供渲染器和测试脚本调用（保留兼容性）。"""
         com_vx = self.physics.get_com_vel(self.q, self.dq)[0]
         return self.planner.get_state(x_current, v_x=com_vx)
 
+    # -------------------------------------------------------- observation
     def _get_obs(self):
+        """
+        13-dim observation:
+          0  theta           体角（相对竖直）
+          1  dtheta          角速度
+          2  l_norm          腿长归一化偏差 l/l_nom - 1  (0=自然长)
+          3  dl              腿伸缩速度
+          4  vx_com          质心水平速度
+          5  vy_com          质心竖直速度
+          6  vx_deficit      规划所需 vx - 实际 vx（支撑相有效，飞行相置零）
+          7  vy_deficit      规划所需 vy - 实际 vy（支撑相有效，飞行相置零）
+          8  dx_target       足端到当前目标的水平距离
+          9  is_touching     接触标志 (0/1)
+         10  target_idx      当前目标序号
+         11  theta_err_td    theta 与落地目标角 phi_td 之差
+         12  stance_ratio    当前连续支撑步数 / 最大支撑步数 (0~1)
+        """
+        com_pos = self.physics.get_com_pos(self.q)
+        com_vel = self.physics.get_com_vel(self.q, self.dq)
         foot_pos = self.physics.get_foot_pos(self.q)
-        if self.current_target_idx < len(self.ecfg.targets):
-            target_x = self.ecfg.targets[self.current_target_idx]
-        else:
-            target_x = foot_pos[0]
 
-        dist_x = target_x - foot_pos[0]
+        target_valid = self.current_target_idx < len(self.ecfg.targets)
+        target_x = (self.ecfg.targets[self.current_target_idx]
+                    if target_valid else foot_pos[0])
+        dx_target = target_x - foot_pos[0]
+
         is_touching = 1.0 if foot_pos[1] <= self.pcfg.ground_y + 0.02 else 0.0
-        y_ideal, dy_ideal = self.get_trajectory_state(self.physics.get_com_pos(self.q)[0])
-        y_error = self.physics.get_com_pos(self.q)[1] - y_ideal
-        dy_error = self.physics.get_com_vel(self.q, self.dq)[1] - dy_ideal
 
-        obs = np.concatenate([
-            self.q,
-            self.dq,
-            [dist_x, float(self.current_target_idx), is_touching, y_error, dy_error],
-        ])
-        return np.clip(obs, -self.ecfg.obs_clip, self.ecfg.obs_clip).astype(np.float32)
+        # 速度亏量：支撑相才有意义
+        if self.planner.valid and is_touching:
+            vx_def = self.planner.vx_nom - float(com_vel[0])
+            vy_def = self.planner.vy_nom - float(com_vel[1])
+        else:
+            vx_def = 0.0
+            vy_def = 0.0
 
+        phi_td = math.radians(self.reward_fn.cfg.phi_td_target_deg)
+        theta_err_td = float(self.q[2]) - phi_td
+
+        stance_ratio = (self.consecutive_stance_steps
+                        / max(self.ecfg.max_consecutive_stance_steps, 1))
+
+        obs = np.array([
+            float(self.q[2]),                              # theta
+            float(self.dq[2]),                             # dtheta
+            float(self.q[3]) / self.pcfg.leg_length - 1.0, # l_norm
+            float(self.dq[3]),                             # dl
+            float(com_vel[0]),                             # vx_com
+            float(com_vel[1]),                             # vy_com
+            vx_def,                                        # vx_deficit
+            vy_def,                                        # vy_deficit
+            dx_target,                                     # dx_target
+            is_touching,                                   # is_touching
+            float(self.current_target_idx),                # target_idx
+            theta_err_td,                                  # theta error vs phi_td
+            float(np.clip(stance_ratio, 0.0, 1.0)),        # stance_ratio
+        ], dtype=np.float32)
+
+        return np.clip(obs, -self.ecfg.obs_clip, self.ecfg.obs_clip)
+
+    # ---------------------------------------------------------------- step
     def step(self, action):
         u1 = float(np.clip(action[0], 0.0, 1.0))
         u2 = float(np.clip(action[1], 0.0, 1.0))
 
+        # 落地目标角 = phi_td；起飞目标角由规划器给出（SLIP 假设下约 90°-alpha）
+        landing_theta   = math.radians(self.reward_fn.cfg.phi_td_target_deg)
+        takeoff_theta   = self.planner.takeoff_theta_target  # pi/2 - theta_opt
+        takeoff_tol     = self.acfg.takeoff_theta_tol
+
         touching = self.physics.step(
-            self.q,
-            self.dq,
-            action,
-            self.acfg.landing_theta,
-            self.planner.takeoff_theta_target,
-            self.acfg.takeoff_theta_tol,
+            self.q, self.dq, action,
+            landing_theta, takeoff_theta, takeoff_tol,
         )
 
         touchdown_event = touching and (not self.prev_touching)
-        liftoff_event = (not touching) and self.prev_touching
+        liftoff_event   = (not touching) and self.prev_touching
 
+        # 连续支撑步计数
         if touching:
-            self.stance_steps += 1
-            self.airborne_steps = 0
+            self.consecutive_stance_steps += 1
         else:
-            self.airborne_steps += 1
-            self.stance_steps = 0
+            self.consecutive_stance_steps = 0
 
+        stance_timeout = (
+            self.consecutive_stance_steps >= self.ecfg.max_consecutive_stance_steps
+        )
+
+        com_pos  = self.physics.get_com_pos(self.q)
+        com_vel  = self.physics.get_com_vel(self.q, self.dq)
         foot_pos = self.physics.get_foot_pos(self.q)
+
         target_valid = self.current_target_idx < len(self.ecfg.targets)
-        target_x = self.ecfg.targets[self.current_target_idx] if target_valid else foot_pos[0]
-        dist_to_target = abs(foot_pos[0] - target_x) if target_valid else 0.0
+        target_x     = (self.ecfg.targets[self.current_target_idx]
+                        if target_valid else foot_pos[0])
+        dx_target     = target_x - foot_pos[0]
+        dist_to_target = abs(float(foot_pos[0]) - float(target_x)) if target_valid else 0.0
 
-        target_hit = False
+        target_hit    = False
         all_targets_done = False
-        terminated = False
-        truncated = False
-        stance_timeout = False
+        terminated    = False
+        truncated     = False
 
-        if touching and self.physics.get_com_vel(self.q, self.dq)[1] > -0.5 and target_valid:
+        # 目标命中检测
+        if touching and com_vel[1] > -0.5 and target_valid:
             if dist_to_target < self.ecfg.target_tolerance:
                 target_hit = True
-                print(
-                    f"Hit target {self.current_target_idx} "
-                    f"(dist={dist_to_target:.2f}, theta={math.degrees(self.q[2]):.1f} deg)"
-                )
+                if self.ecfg.print_hit_events:
+                    print(
+                        f"Hit target {self.current_target_idx} "
+                        f"(dist={dist_to_target:.2f}, theta={math.degrees(self.q[2]):.1f}°)"
+                    )
                 self.current_target_idx += 1
                 if self.current_target_idx >= len(self.ecfg.targets):
                     all_targets_done = True
                     terminated = True
                 else:
-                    com_pos = self.physics.get_com_pos(self.q)
-                    self.planner.plan(com_pos[0], com_pos[1], self.ecfg.targets[self.current_target_idx])
+                    com_now = self.physics.get_com_pos(self.q)
+                    self.planner.plan(
+                        com_now[0], com_now[1],
+                        self.ecfg.targets[self.current_target_idx],
+                        landing_theta=landing_theta,
+                    )
 
-                # Anti-local-optimum guard: terminate if policy keeps collapsing in stance.
-                if touching and self.stance_steps >= self.ecfg.max_consecutive_stance_steps:
-                    stance_timeout = True
-                    terminated = True
-
-        # Remove angle-limit termination to avoid trapping policy in local optimum.
-        # Keep only safety-related vertical bounds.
+        # 异常终止检测
         terminated_bad = (
-            self.physics.get_com_pos(self.q)[1] > self.reward_fn.cfg.max_height
-            or self.physics.get_com_pos(self.q)[1] < self.pcfg.min_com_height
+            float(com_pos[1]) > self.reward_fn.cfg.max_height
+            or float(com_pos[1]) < self.pcfg.min_com_height
+            or abs(float(self.q[2])) > self.reward_fn.cfg.max_tilt_rad
         )
         out_of_bounds = (
-            self.q[0] < -1.0
-            or (target_valid and foot_pos[0] > target_x + self.reward_fn.cfg.max_overshoot)
+            float(self.q[0]) < -1.0
+            or (target_valid and float(foot_pos[0]) > float(target_x) + self.reward_fn.cfg.max_overshoot)
         )
-        if terminated_bad or out_of_bounds:
+        if terminated_bad or out_of_bounds or stance_timeout:
             terminated = True
 
-        y_ideal, dy_ideal = self.get_trajectory_state(self.physics.get_com_pos(self.q)[0])
-        y_error = self.physics.get_com_pos(self.q)[1] - y_ideal
-        dy_error = self.physics.get_com_vel(self.q, self.dq)[1] - dy_ideal
-
         reward, reward_info = self.reward_fn.compute(
-            theta=self.q[2],
-            dtheta=self.dq[2],
-            vx=self.physics.get_com_vel(self.q, self.dq)[0],
+            theta=float(self.q[2]),
+            dtheta=float(self.dq[2]),
+            vx_com=float(com_vel[0]),
+            vy_com=float(com_vel[1]),
+            l_curr=float(self.q[3]),
+            l_nominal=self.pcfg.leg_length,
+            dl=float(self.dq[3]),
+            stroke_length=self.pcfg.stroke_length,
             touching=touching,
             touchdown_event=touchdown_event,
             liftoff_event=liftoff_event,
             traj_valid=self.planner.valid,
-            y_error=y_error,
-            dy_error=dy_error,
-            traj_vx_nom=self.planner.vx_nom,
-            com_y=self.physics.get_com_pos(self.q)[1],
-            l_curr=self.q[3],
-            l_nominal=self.pcfg.leg_length,
-            stroke_length=self.pcfg.stroke_length,
-            landing_theta_target=self.acfg.landing_theta,
-            takeoff_theta_target=self.planner.takeoff_theta_target,
+            vx_nom=self.planner.vx_nom,
+            vy_nom=self.planner.vy_nom,
+            dx_target=dx_target,
             u1=u1,
             u2=u2,
-            dist_to_target=dist_to_target,
-            target_x=target_x,
-            foot_x=foot_pos[0],
-            target_valid=target_valid,
-            current_target_idx=self.current_target_idx,
+            # Bug fix: pass real coordinates — old code defaulted both to 0.0,
+            # making landing_proximity reward always 30 regardless of foot position.
+            foot_x=float(foot_pos[0]),
+            target_x=float(target_x),
             target_hit=target_hit,
             all_targets_done=all_targets_done,
             terminated_bad=terminated_bad,

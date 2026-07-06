@@ -74,3 +74,10 @@ Hopper-sim-Isaac/outputs/
 
 # ===== 项目特定（旧的、临时的）=====
 # 如果以后整理，可以加具体路径
+
+# Generated Quadhopper figure sharing workspace; commit the zip package instead.
+analysis_outputs/quadhopper_figure_package_20260705/
+
+# Superseded combined figures kept locally only.
+analysis_outputs/quadhopper_release_six_cycle_windows.pdf
+analysis_outputs/quadhopper_stable_six_cycle_windows.pdf

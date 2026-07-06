@@ -1,4 +1,24 @@
-"""Reward function for QuadHopper."""
+"""
+Reward function for QuadHopper.
+
+设计思路
+--------
+1. Liftoff event (主要训练信号)
+   在起飞瞬间，检查实际 (vx_com, vy_com) 是否满足弹道扇形条件：
+   - 发射角 alpha = atan2(vy, vx) 在 [alpha_min, alpha_max] 扇区内
+   - 速度幅值接近规划器计算的弹道所需速度 v0_nom
+   满足条件后关闭控制，系统被动到达目标。
+
+2. Stance phase (倒立摆 + 弹簧)
+   - 奖励 dtheta > 0（机体顺时针摆动，从后倾到前倾）
+   - 奖励弹簧压缩（theta < 0）和伸展（theta > 0）
+
+3. Touchdown event
+   - 奖励正确的落地攻角 phi_td（后倾 theta < 0）
+
+4. Flight phase (小幅姿态调整)
+   - 仅在顶点附近调整姿态，保证落地角正确
+"""
 
 import math
 from dataclasses import dataclass
@@ -9,23 +29,17 @@ from .config import RewardConfig
 
 @dataclass
 class RewardInfo:
-    """Breakdown of reward components for logging/debugging."""
-    flight_track: float = 0.0
-    flight_dy_track: float = 0.0
-    flight_target: float = 0.0
-    flight_overshoot: float = 0.0
-    flight_vx_track: float = 0.0
+    liftoff_v: float = 0.0
+    liftoff_angle: float = 0.0
+    stance_pendulum: float = 0.0
+    stance_spring: float = 0.0
+    stance_theta_pos: float = 0.0
+    stance_stall: float = 0.0
+    stance_timeout: float = 0.0
+    touchdown: float = 0.0
+    landing_proximity: float = 0.0   # dense reward: foot lands near next target
     flight_attitude: float = 0.0
     flight_thrust: float = 0.0
-    flight_ang_vel: float = 0.0
-    first_target: float = 0.0
-    touchdown: float = 0.0
-    stance_attitude: float = 0.0
-    stance_compression: float = 0.0
-    stance_stall: float = 0.0
-    liftoff: float = 0.0
-    airborne_height: float = 0.0
-    attitude_pen: float = 0.0
     target_hit: float = 0.0
     termination: float = 0.0
 
@@ -35,162 +49,139 @@ class RewardInfo:
 
 
 class RewardFunction:
-    """Stateless reward function with explicit component breakdown."""
-
     def __init__(self, cfg: RewardConfig):
         self.cfg = cfg
 
     @staticmethod
-    def _wrap_angle(angle: float) -> float:
-        return (angle + math.pi) % (2 * math.pi) - math.pi
+    def _wrap(a: float) -> float:
+        return (a + math.pi) % (2 * math.pi) - math.pi
 
     def compute(
         self,
         *,
-        # Kinematic state
+        # 当前状态
         theta: float,
         dtheta: float,
-        vx: float,
-        # Contact events
+        vx_com: float,
+        vy_com: float,
+        l_curr: float,
+        l_nominal: float,
+        dl: float,
+        stroke_length: float,
+        # 接触事件
         touching: bool,
         touchdown_event: bool,
         liftoff_event: bool,
-        # Trajectory tracking
+        # 规划器目标（弹道所需速度）
         traj_valid: bool,
-        y_error: float,
-        dy_error: float,
-        traj_vx_nom: float,
-        # Geometry
-        com_y: float,
-        l_curr: float,
-        l_nominal: float,
-        stroke_length: float,
-        # Attitude targets
-        landing_theta_target: float,
-        takeoff_theta_target: float,
-        # Actions
+        vx_nom: float,
+        vy_nom: float,
+        dx_target: float,
+        # 控制输入
         u1: float,
         u2: float,
-        # Target geometry
-        dist_to_target: float,
-        target_x: float,
-        foot_x: float,
-        target_valid: bool,
-        current_target_idx: int,
-        # Target success flag (set externally)
+        # 落点信息（用于 landing proximity reward）
+        foot_x: float = 0.0,
+        target_x: float = 0.0,
+        # 离散事件标志
         target_hit: bool = False,
         all_targets_done: bool = False,
-        # Termination flags
         terminated_bad: bool = False,
         out_of_bounds: bool = False,
         stance_timeout: bool = False,
     ) -> Tuple[float, RewardInfo]:
-        """
-        Compute the total reward and its breakdown.
-
-        Returns:
-            (total_reward, RewardInfo)
-        """
         c = self.cfg
         info = RewardInfo()
 
-        # ── 1. Flight phase ────────────────────────────────────────────────
-        if (not touching) and traj_valid:
-            info.flight_track = c.flight_traj_track_weight * math.exp(
-                -c.flight_traj_track_sharpness * abs(y_error)
-            )
-            info.flight_dy_track = c.flight_dy_track_weight * math.exp(
-                -c.flight_dy_track_sharpness * abs(dy_error)
-            )
+        # ── 1. 起飞事件：弹道扇形区奖励（主要信号）─────────────────────
+        if liftoff_event and traj_valid and dx_target > 0.1:
+            v0_actual = math.hypot(vx_com, vy_com)
+            v0_nom    = math.hypot(vx_nom, vy_nom)
+            alpha_actual = math.atan2(vy_com, vx_com)   # 实际发射角（相对水平）
+            alpha_nom    = math.atan2(vy_nom, vx_nom)   # 规划发射角
+            alpha_deg    = math.degrees(alpha_actual)
 
-            if target_valid:
-                info.flight_target = c.flight_target_weight * math.exp(
-                    -c.flight_target_sharpness * dist_to_target
-                )
-                overshoot = foot_x - target_x
-                if overshoot > 0.0:
-                    info.flight_overshoot = -c.flight_overshoot_penalty * overshoot
+            in_sector = c.alpha_min_deg <= alpha_deg <= c.alpha_max_deg
 
-            info.flight_thrust = -c.flight_thrust_penalty * (u1 + u2)
-
-            if traj_vx_nom > 0.0:
-                info.flight_vx_track = -c.flight_vx_track_penalty * abs(vx - traj_vx_nom)
-
-            theta_err_land = abs(
-                self._wrap_angle(theta - landing_theta_target)
-            )
-            info.flight_attitude = c.flight_attitude_weight * math.exp(
-                -c.flight_attitude_sharpness * theta_err_land
-            )
-            info.flight_ang_vel = -c.flight_angular_vel_penalty * abs(dtheta)
-
-            if target_valid and current_target_idx == 0:
-                info.first_target = c.first_target_weight * math.exp(
-                    -c.first_target_sharpness * dist_to_target
+            # 速度幅值奖励：实际 v0 与弹道所需 v0 的接近程度
+            if v0_nom > 0.1 and in_sector:
+                v_err_norm = (v0_actual - v0_nom) / v0_nom
+                info.liftoff_v = c.liftoff_v_weight * math.exp(
+                    -c.liftoff_v_sharpness * v_err_norm ** 2
                 )
 
-        # Small positive signal for achieving meaningful airborne height.
-        if not touching:
-            height_margin = max(com_y - c.airborne_height_ref, 0.0)
-            info.airborne_height = c.airborne_height_reward * math.tanh(4.0 * height_margin)
-
-        # ── 2. Touchdown event ─────────────────────────────────────────────
-        if touchdown_event:
-            theta_td_err = abs(self._wrap_angle(theta - landing_theta_target))
-            if theta < 0.0:
-                info.touchdown = c.touchdown_reward * math.exp(
-                    -c.touchdown_sharpness * theta_td_err
+            # 发射角奖励：与规划角的误差
+            alpha_err = abs(self._wrap(alpha_actual - alpha_nom))
+            alpha_center = math.radians(0.5 * (c.alpha_min_deg + c.alpha_max_deg))
+            if in_sector:
+                info.liftoff_angle = c.liftoff_angle_weight * math.exp(
+                    -c.liftoff_angle_sharpness * alpha_err
                 )
             else:
-                info.touchdown = -(c.touchdown_bad_penalty
-                                   + c.touchdown_bad_slope * theta_td_err)
+                # 扇区外：软惩罚，鼓励往扇区靠拢
+                err_from_center = abs(self._wrap(alpha_actual - alpha_center))
+                info.liftoff_angle = -c.liftoff_angle_weight * 0.3 * err_from_center
 
-        # ── 3. Stance / liftoff ────────────────────────────────────────────
+        # ── 2. 支撑相：倒立摆 + 弹簧 ──────────────────────────────────────
         if touching:
-            theta_to_to = abs(
-                self._wrap_angle(theta - takeoff_theta_target)
-            )
-            info.stance_attitude = c.stance_attitude_weight * math.exp(
-                -c.stance_attitude_sharpness * theta_to_to
-            )
+            # 奖励顺时针摆动（dtheta > 0：从后倾→直立→前倾）
+            info.stance_pendulum = c.stance_pendulum_weight * max(dtheta, 0.0)
 
-            # Penalize deep leg compression and lingering in stance.
+            # 摆过竖直（theta > 0）的显式奖励：鼓励机体到达正角区
+            if theta > 0.0:
+                info.stance_theta_pos = c.stance_theta_pos_weight * math.sin(theta)
+
+            # 弹簧循环奖励
             stroke = max(stroke_length, 1e-6)
-            compression_ratio = max((l_nominal - l_curr) / stroke, 0.0)
-            info.stance_compression = -c.stance_compression_penalty * (compression_ratio ** 2)
+            compress_ratio = max((l_nominal - l_curr) / stroke, 0.0)
+            if theta < 0.0:
+                # 压缩加载阶段（后倾）：奖励腿部压缩储能
+                info.stance_spring = c.stance_spring_weight * math.tanh(4.0 * compress_ratio)
+            else:
+                # 伸展释放阶段（前倾）：奖励快速伸腿
+                info.stance_spring = c.stance_spring_weight * 0.5 * max(dl, 0.0)
+
             info.stance_stall = -c.stance_stall_penalty
 
-        if liftoff_event:
-            theta_lo_err = abs(
-                self._wrap_angle(theta - takeoff_theta_target)
-            )
-            info.liftoff = c.liftoff_reward * math.exp(
-                -c.liftoff_sharpness * theta_lo_err
+        if stance_timeout:
+            info.stance_timeout = -c.stance_timeout_penalty
+
+        # ── 3. 落地事件：攻角奖励 + 落点接近目标奖励 ────────────────────
+        if touchdown_event:
+            phi_td = math.radians(c.phi_td_target_deg)
+            td_err = abs(self._wrap(theta - phi_td))
+            if theta < 0.0:
+                info.touchdown = c.touchdown_weight * math.exp(
+                    -c.touchdown_sharpness * td_err
+                )
+            else:
+                info.touchdown = -c.touchdown_bad_penalty
+
+            # 落点接近奖励：foot_x 越接近 target_x 越高（密集塑形信号）
+            dist_foot_to_target = abs(foot_x - target_x)
+            info.landing_proximity = c.landing_proximity_weight * math.exp(
+                -c.landing_proximity_sharpness * dist_foot_to_target ** 2
             )
 
-        # ── 4. Attitude penalty ────────────────────────────────────────────
-        info.attitude_pen = (
-            -c.attitude_abs_penalty * abs(theta)
-            - c.angular_vel_penalty * abs(dtheta)
-        )
+        # ── 4. 飞行相：姿态引导（顶点附近调整至目标落地角）──────────────
+        if not touching:
+            phi_td = math.radians(c.phi_td_target_deg)
+            att_err = abs(self._wrap(theta - phi_td))
+            info.flight_attitude = c.flight_attitude_weight * math.exp(
+                -c.flight_attitude_sharpness * att_err
+            )
+            info.flight_thrust = -c.flight_thrust_penalty * (u1 + u2)
 
-        # ── 5. Target reward ───────────────────────────────────────────────
+        # ── 5. 目标命中 ────────────────────────────────────────────────────
         if target_hit:
             info.target_hit += c.target_hit_reward
         if all_targets_done:
             info.target_hit += c.all_targets_bonus
-        elif target_valid and dist_to_target < c.near_target_radius:
-            info.target_hit += c.near_target_weight * (
-                c.near_target_radius - dist_to_target
-            )
 
-        # ── 6. Termination ─────────────────────────────────────────────────
+        # ── 6. 终止惩罚 ────────────────────────────────────────────────────
         if terminated_bad:
             info.termination -= c.termination_penalty
         if out_of_bounds:
             info.termination -= c.out_of_bounds_penalty
-        if stance_timeout:
-            info.termination -= c.stance_timeout_penalty
 
         return info.total, info
-

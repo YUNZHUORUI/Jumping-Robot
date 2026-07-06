@@ -3,7 +3,9 @@
 import math
 import numpy as np
 
-from .config import AttitudeConfig, EnvConfig, PhysicsConfig
+from .config import EnvConfig, PhysicsConfig
+
+_DEFAULT_TAKEOFF_THETA = math.pi / 4  # placeholder until plan() computes pi/2 - theta_opt
 
 
 class TrajectoryPlanner:
@@ -13,11 +15,9 @@ class TrajectoryPlanner:
         self,
         physics_cfg: PhysicsConfig,
         env_cfg: EnvConfig,
-        attitude_cfg: AttitudeConfig,
     ):
         self.physics = physics_cfg
         self.env = env_cfg
-        self.att = attitude_cfg
 
         self.a: float = 0.0
         self.b_local: float = 0.0
@@ -28,7 +28,7 @@ class TrajectoryPlanner:
         self.v0_min: float = 0.0
         self.theta_opt: float = 0.0
         self.valid: bool = False
-        self.takeoff_theta_target: float = attitude_cfg.takeoff_theta
+        self.takeoff_theta_target: float = _DEFAULT_TAKEOFF_THETA
 
     def reset(self):
         self.valid = False
@@ -40,7 +40,7 @@ class TrajectoryPlanner:
         self.vy_nom = 0.0
         self.v0_min = 0.0
         self.theta_opt = 0.0
-        self.takeoff_theta_target = self.att.takeoff_theta
+        self.takeoff_theta_target = _DEFAULT_TAKEOFF_THETA
 
     def plan(
         self,
@@ -48,8 +48,9 @@ class TrajectoryPlanner:
         y_curr: float,
         target_x_foot: float,
         rng: np.random.Generator = None,
+        landing_theta: float = None,
     ) -> bool:
-        estimated_land_theta = math.radians(-15.0)
+        estimated_land_theta = math.radians(-3.0) if landing_theta is None else float(landing_theta)
         offset_x = self.physics.leg_length * math.sin(estimated_land_theta)
         x_target_com = target_x_foot - offset_x
 
