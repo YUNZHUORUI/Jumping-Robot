@@ -4,13 +4,13 @@ from isaaclab_rl.rsl_rl import RslRlOnPolicyRunnerCfg, RslRlPpoActorCriticCfg, R
 @configclass
 class QuadhopperPPORunnerCfg(RslRlOnPolicyRunnerCfg):
     num_steps_per_env = 256
-    max_iterations = 1000
+    max_iterations = 250
     save_interval = 100
     experiment_name = "quadhopper"
     empirical_normalization = True
 
     policy = RslRlPpoActorCriticCfg(
-        init_noise_std=0.8,
+        init_noise_std=0.4,
         class_name="ActorCriticRecurrent",
         actor_hidden_dims=[256, 128],
         critic_hidden_dims=[256, 256],
@@ -21,7 +21,7 @@ class QuadhopperPPORunnerCfg(RslRlOnPolicyRunnerCfg):
         value_loss_coef=0.5,
         use_clipped_value_loss=True,
         clip_param=0.2,
-        entropy_coef=0.005,
+        entropy_coef=0.01,
         num_learning_epochs=5,
         num_mini_batches=8,
         learning_rate=3.0e-4,
