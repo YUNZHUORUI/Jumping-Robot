@@ -86,6 +86,7 @@ class TrajectoryPlanner:
         apex_required_rel = max(
             apex_min_energy_rel * apex_scale,
             (max(y_curr, y_target) - y_curr) + apex_clearance,
+            max(float(getattr(self.env, "traj_apex_height", 0.0)) - y_curr, 0.0),
         )
 
         vy_nom = math.sqrt(max(2.0 * g * apex_required_rel, 1e-8))

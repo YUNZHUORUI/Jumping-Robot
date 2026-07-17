@@ -18,6 +18,7 @@ import math
 import numpy as np
 import matplotlib.pyplot as plt
 import imageio
+from pathlib import Path
 from typing import List, Dict
 
 from .config import RenderConfig
@@ -159,6 +160,7 @@ class QuadhopperRenderer:
         if not self.frames:
             print("No frames to save.")
             return
+        Path(self.cfg.gif_path).parent.mkdir(parents=True, exist_ok=True)
         imageio.mimsave(self.cfg.gif_path, self.frames, fps=self.cfg.fps)
         print(f"GIF saved: {self.cfg.gif_path}")
 
@@ -191,6 +193,7 @@ class QuadhopperRenderer:
         ax3.legend(); ax3.grid(True, alpha=0.4)
 
         plt.tight_layout()
+        Path(path).parent.mkdir(parents=True, exist_ok=True)
         plt.savefig(path, dpi=120)
         print(f"Analysis saved: {path}")
         plt.close(fig)

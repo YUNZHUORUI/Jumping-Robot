@@ -38,6 +38,8 @@ class RewardInfo:
     stance_timeout: float = 0.0
     touchdown: float = 0.0
     landing_proximity: float = 0.0   # dense reward: foot lands near next target
+    forward_progress: float = 0.0
+    flight_height: float = 0.0
     flight_attitude: float = 0.0
     flight_thrust: float = 0.0
     target_hit: float = 0.0
@@ -66,6 +68,7 @@ class RewardFunction:
         vy_com: float,
         l_curr: float,
         l_nominal: float,
+        com_y: float,
         dl: float,
         stroke_length: float,
         # 接触事件
@@ -146,6 +149,14 @@ class RewardFunction:
         if stance_timeout:
             info.stance_timeout = -c.stance_timeout_penalty
 
+        # Dense shaping: reward moving the COM toward the current target.
+        # This keeps early PPO exploration from settling into "stand and twitch".
+        if dx_target > 0.05:
+            if vx_com >= 0.0:
+                info.forward_progress = c.forward_progress_weight * min(vx_com, 2.5)
+            else:
+                info.forward_progress = c.backward_progress_penalty * vx_com
+
         # ── 3. 落地事件：攻角奖励 + 落点接近目标奖励 ────────────────────
         if touchdown_event:
             phi_td = math.radians(c.phi_td_target_deg)
@@ -165,6 +176,12 @@ class RewardFunction:
 
         # ── 4. 飞行相：姿态引导（顶点附近调整至目标落地角）──────────────
         if not touching:
+            height_err = com_y - c.target_height
+            info.flight_height = c.flight_height_weight * math.exp(
+                -c.flight_height_sharpness * height_err ** 2
+            )
+            if height_err > 0.0:
+                info.flight_height -= c.overheight_penalty_weight * height_err ** 2
             phi_td = math.radians(c.phi_td_target_deg)
             att_err = abs(self._wrap(theta - phi_td))
             info.flight_attitude = c.flight_attitude_weight * math.exp(

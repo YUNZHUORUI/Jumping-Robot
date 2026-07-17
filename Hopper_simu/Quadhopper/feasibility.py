@@ -53,7 +53,7 @@ def _is_touching(env: QuadhopperTargetEnv) -> bool:
 
 
 def _constant_action(left: float, right: float) -> ActionPolicy:
-    action = np.array([left, right], dtype=np.float32)
+    action = np.array([2.0 * left - 1.0, 2.0 * right - 1.0], dtype=np.float32)
 
     def policy(_step: int, _env: QuadhopperTargetEnv) -> np.ndarray:
         return action
@@ -62,11 +62,13 @@ def _constant_action(left: float, right: float) -> ActionPolicy:
 
 
 def _pulse_action(base: float, diff: float, burn_steps: int, coast: float) -> ActionPolicy:
-    thrust = np.array(
+    motor_cmd = np.array(
         [np.clip(base - diff, 0.0, 1.0), np.clip(base + diff, 0.0, 1.0)],
         dtype=np.float32,
     )
-    coast_action = np.array([coast, coast], dtype=np.float32)
+    coast_cmd = np.array([coast, coast], dtype=np.float32)
+    thrust = 2.0 * motor_cmd - 1.0
+    coast_action = 2.0 * coast_cmd - 1.0
 
     def policy(step: int, _env: QuadhopperTargetEnv) -> np.ndarray:
         return thrust if step < burn_steps else coast_action

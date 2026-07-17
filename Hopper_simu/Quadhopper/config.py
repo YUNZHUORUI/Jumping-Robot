@@ -135,10 +135,10 @@ class EnvConfig:
     print_hit_events: bool = True
 
     # Reset modes:
-    # - "ballistic": legacy curriculum start with planned initial velocity.
     # - "ground": start in stance from rest, for real target-jump feasibility tests.
-    reset_mode: str = "ballistic"
-    ground_init_leg_compression: float = 0.035
+    # - "ballistic": legacy curriculum start with planned initial velocity.
+    reset_mode: str = "ground"
+    ground_init_leg_compression: float = 0.065
     ground_init_theta_min_deg: float = -6.0
     ground_init_theta_max_deg: float = 6.0
 
@@ -163,7 +163,8 @@ class EnvConfig:
     # Larger values -> higher apex, usually less leg compression near touchdown.
     traj_apex_scale: float = 1.22
     traj_apex_clearance: float = 0.22
-    traj_min_vx: float = 1.0
+    traj_apex_height: float = 1.0
+    traj_min_vx: float = 0.25
     traj_max_vx: float = 8.0
 
     # Anti-local-optimum guards
@@ -171,6 +172,8 @@ class EnvConfig:
     max_consecutive_stance_steps: int = 180  # 180 × 0.01 s = 1.8 s (allows full pendulum swing + bigger launches)
     # Expected minimum airborne steps after liftoff before returning stance.
     min_airborne_steps: int = 5              # 5 × 0.01 s = 0.05 s
+    no_progress_steps: int = 220             # terminate if it stays near the start too long
+    no_progress_min_delta: float = 0.04      # metres of new forward foot progress required
 
 
 @dataclass
@@ -191,7 +194,7 @@ class RewardConfig:
     """
     # ── Ballistic sector bounds ───────────────────────────────────────────
     alpha_min_deg: float = 5.0           # min liftoff angle — natural SLIP gives 12-26°, must include this
-    alpha_max_deg: float = 75.0          # max liftoff angle from horizontal (°)
+    alpha_max_deg: float = 85.0          # high 0.5 m hops to 1 m need ~80° launch angle
 
     # ── Liftoff event (main signal) ───────────────────────────────────────
     liftoff_v_weight: float = 80.0       # reward matching planned v0
@@ -215,7 +218,15 @@ class RewardConfig:
     # ── Flight attitude (apex adjustment toward phi_td) ───────────────────
     flight_attitude_weight: float = 2.0   # stronger signal: policy must control theta during flight
     flight_attitude_sharpness: float = 3.0
-    flight_thrust_penalty: float = 1.5
+    flight_thrust_penalty: float = 0.15
+    flight_height_weight: float = 8.0
+    flight_height_sharpness: float = 6.0
+    overheight_penalty_weight: float = 18.0
+    target_height: float = 1.0
+
+    # ── Dense progress shaping ────────────────────────────────────────────
+    forward_progress_weight: float = 0.35
+    backward_progress_penalty: float = 0.20
 
     # ── Landing proximity (dense shaping at each touchdown) ──────────────
     landing_proximity_weight: float = 30.0  # reward foot landing near next target
@@ -229,7 +240,7 @@ class RewardConfig:
     termination_penalty: float = 60.0
     out_of_bounds_penalty: float = 60.0
     max_tilt_rad: float = 1.1             # ~63°; enough for liftoff lean, stops tumbles
-    max_height: float = 8.0
+    max_height: float = 1.7
     min_height: float = 0.04
     max_overshoot: float = 0.4
 
@@ -237,7 +248,8 @@ class RewardConfig:
 @dataclass
 class TrainingConfig:
     """PPO training hyperparameters."""
-    model_path: str = "ppo_quadhopper_v2"
+    model_path: str = "artifacts/models/ppo_quadhopper_v7_height_bounded_single"
+    target_count: int = 1
     n_envs: int = 8
     total_timesteps: int = 8_000_000
     learning_rate: float = 3e-4
@@ -251,8 +263,8 @@ class TrainingConfig:
 @dataclass
 class RenderConfig:
     """Rendering and visualization settings."""
-    gif_path: str = "quadhopper_v2.gif"
-    plot_path: str = "thrust_analysis_v2.png"
+    gif_path: str = "artifacts/renders/quadhopper_v7_height_bounded_single.gif"
+    plot_path: str = "artifacts/renders/thrust_analysis_v7_height_bounded_single.png"
     fps: int = 25
     render_every_n: int = 2
     fig_width: int = 12

@@ -26,10 +26,12 @@ class QuadhopperTargetEnv(gym.Env):
         self.planner  = TrajectoryPlanner(physics_cfg, env_cfg)
         self.reward_fn = RewardFunction(reward_cfg)
 
-        self.action_space = spaces.Box(low=0.0, high=1.0, shape=(2,), dtype=np.float32)
-        # 13-dim observation (see _get_obs for full description)
+        # PPO works best with symmetric normalized actions.  These are mapped
+        # to physical motor commands in [0, 1] inside step().
+        self.action_space = spaces.Box(low=-1.0, high=1.0, shape=(2,), dtype=np.float32)
+        # 15-dim observation (see _get_obs for full description)
         self.observation_space = spaces.Box(
-            low=-np.inf, high=np.inf, shape=(13,), dtype=np.float32
+            low=-np.inf, high=np.inf, shape=(15,), dtype=np.float32
         )
 
         self.q  = np.zeros(4, dtype=np.float64)
@@ -38,6 +40,14 @@ class QuadhopperTargetEnv(gym.Env):
         self.steps                   = 0
         self.prev_touching           = False
         self.consecutive_stance_steps = 0
+        self.last_motor_cmd          = np.zeros(2, dtype=np.float32)
+        self.best_foot_x             = 0.0
+        self.no_progress_counter     = 0
+
+    @staticmethod
+    def _action_to_motor_cmd(action) -> np.ndarray:
+        action = np.asarray(action, dtype=np.float64)
+        return np.clip(0.5 * (action + 1.0), 0.0, 1.0).astype(np.float32)
 
     # ---------------------------------------------------------------- reset
     def reset(self, seed=None, options=None):
@@ -52,6 +62,8 @@ class QuadhopperTargetEnv(gym.Env):
         self.steps                    = 0
         self.prev_touching            = False
         self.consecutive_stance_steps = 0
+        self.best_foot_x              = 0.0
+        self.no_progress_counter      = 0
 
         landing_theta = math.radians(self.reward_fn.cfg.phi_td_target_deg)
 
@@ -134,20 +146,22 @@ class QuadhopperTargetEnv(gym.Env):
     # -------------------------------------------------------- observation
     def _get_obs(self):
         """
-        13-dim observation:
+        15-dim observation:
           0  theta           体角（相对竖直）
           1  dtheta          角速度
           2  l_norm          腿长归一化偏差 l/l_nom - 1  (0=自然长)
           3  dl              腿伸缩速度
           4  vx_com          质心水平速度
           5  vy_com          质心竖直速度
-          6  vx_deficit      规划所需 vx - 实际 vx（支撑相有效，飞行相置零）
-          7  vy_deficit      规划所需 vy - 实际 vy（支撑相有效，飞行相置零）
-          8  dx_target       足端到当前目标的水平距离
-          9  is_touching     接触标志 (0/1)
-         10  target_idx      当前目标序号
-         11  theta_err_td    theta 与落地目标角 phi_td 之差
-         12  stance_ratio    当前连续支撑步数 / 最大支撑步数 (0~1)
+          6  com_y           质心高度
+          7  height_err      目标跳跃高度 - 质心高度
+          8  vx_deficit      规划所需 vx - 实际 vx（支撑相有效，飞行相置零）
+          9  vy_deficit      规划所需 vy - 实际 vy（支撑相有效，飞行相置零）
+         10  dx_target       足端到当前目标的水平距离
+         11  is_touching     接触标志 (0/1)
+         12  target_idx      当前目标序号
+         13  theta_err_td    theta 与落地目标角 phi_td 之差
+         14  stance_ratio    当前连续支撑步数 / 最大支撑步数 (0~1)
         """
         com_pos = self.physics.get_com_pos(self.q)
         com_vel = self.physics.get_com_vel(self.q, self.dq)
@@ -158,7 +172,7 @@ class QuadhopperTargetEnv(gym.Env):
                     if target_valid else foot_pos[0])
         dx_target = target_x - foot_pos[0]
 
-        is_touching = 1.0 if foot_pos[1] <= self.pcfg.ground_y + 0.02 else 0.0
+        is_touching = 1.0 if self.physics.stance_active else 0.0
 
         # 速度亏量：支撑相才有意义
         if self.planner.valid and is_touching:
@@ -181,6 +195,8 @@ class QuadhopperTargetEnv(gym.Env):
             float(self.dq[3]),                             # dl
             float(com_vel[0]),                             # vx_com
             float(com_vel[1]),                             # vy_com
+            float(com_pos[1]),                             # com_y
+            float(self.reward_fn.cfg.target_height - com_pos[1]), # height_err
             vx_def,                                        # vx_deficit
             vy_def,                                        # vy_deficit
             dx_target,                                     # dx_target
@@ -194,8 +210,10 @@ class QuadhopperTargetEnv(gym.Env):
 
     # ---------------------------------------------------------------- step
     def step(self, action):
-        u1 = float(np.clip(action[0], 0.0, 1.0))
-        u2 = float(np.clip(action[1], 0.0, 1.0))
+        motor_cmd = self._action_to_motor_cmd(action)
+        self.last_motor_cmd = motor_cmd
+        u1 = float(motor_cmd[0])
+        u2 = float(motor_cmd[1])
 
         # 落地目标角 = phi_td；起飞目标角由规划器给出（SLIP 假设下约 90°-alpha）
         landing_theta   = math.radians(self.reward_fn.cfg.phi_td_target_deg)
@@ -203,7 +221,7 @@ class QuadhopperTargetEnv(gym.Env):
         takeoff_tol     = self.acfg.takeoff_theta_tol
 
         touching = self.physics.step(
-            self.q, self.dq, action,
+            self.q, self.dq, motor_cmd,
             landing_theta, takeoff_theta, takeoff_tol,
         )
 
@@ -234,6 +252,19 @@ class QuadhopperTargetEnv(gym.Env):
         all_targets_done = False
         terminated    = False
         truncated     = False
+
+        progress_margin = self.ecfg.no_progress_min_delta
+        if float(foot_pos[0]) > self.best_foot_x + progress_margin:
+            self.best_foot_x = float(foot_pos[0])
+            self.no_progress_counter = 0
+        else:
+            self.no_progress_counter += 1
+
+        no_progress_timeout = (
+            target_valid
+            and self.no_progress_counter >= self.ecfg.no_progress_steps
+            and dist_to_target > self.ecfg.target_tolerance
+        )
 
         # 目标命中检测
         if touching and com_vel[1] > -0.5 and target_valid:
@@ -266,7 +297,7 @@ class QuadhopperTargetEnv(gym.Env):
             float(self.q[0]) < -1.0
             or (target_valid and float(foot_pos[0]) > float(target_x) + self.reward_fn.cfg.max_overshoot)
         )
-        if terminated_bad or out_of_bounds or stance_timeout:
+        if terminated_bad or out_of_bounds or stance_timeout or no_progress_timeout:
             terminated = True
 
         reward, reward_info = self.reward_fn.compute(
@@ -276,6 +307,7 @@ class QuadhopperTargetEnv(gym.Env):
             vy_com=float(com_vel[1]),
             l_curr=float(self.q[3]),
             l_nominal=self.pcfg.leg_length,
+            com_y=float(com_pos[1]),
             dl=float(self.dq[3]),
             stroke_length=self.pcfg.stroke_length,
             touching=touching,
@@ -293,7 +325,7 @@ class QuadhopperTargetEnv(gym.Env):
             target_x=float(target_x),
             target_hit=target_hit,
             all_targets_done=all_targets_done,
-            terminated_bad=terminated_bad,
+            terminated_bad=terminated_bad or no_progress_timeout,
             out_of_bounds=out_of_bounds,
             stance_timeout=stance_timeout,
         )
