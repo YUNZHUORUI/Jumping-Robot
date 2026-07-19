@@ -43,6 +43,8 @@ class QuadhopperTargetEnv(gym.Env):
         self.last_motor_cmd          = np.zeros(2, dtype=np.float32)
         self.best_foot_x             = 0.0
         self.no_progress_counter     = 0
+        self.prev_vy                 = 0.0
+        self.hop_max_height          = 0.0
 
     @staticmethod
     def _action_to_motor_cmd(action) -> np.ndarray:
@@ -64,6 +66,8 @@ class QuadhopperTargetEnv(gym.Env):
         self.consecutive_stance_steps = 0
         self.best_foot_x              = 0.0
         self.no_progress_counter      = 0
+        self.prev_vy                  = 0.0
+        self.hop_max_height           = 0.0
 
         landing_theta = math.radians(self.reward_fn.cfg.phi_td_target_deg)
 
@@ -84,6 +88,7 @@ class QuadhopperTargetEnv(gym.Env):
             self.consecutive_stance_steps = 1
 
             com_pos = self.physics.get_com_pos(self.q)
+            self.hop_max_height = float(com_pos[1])
             self.planner.plan(
                 com_pos[0], com_pos[1],
                 self.ecfg.targets[self.current_target_idx],
@@ -106,6 +111,7 @@ class QuadhopperTargetEnv(gym.Env):
         self.dq = np.zeros(4, dtype=np.float64)
 
         com_pos = self.physics.get_com_pos(self.q)
+        self.hop_max_height = float(com_pos[1])
         self.planner.plan(
             com_pos[0], com_pos[1],
             self.ecfg.targets[self.current_target_idx],
@@ -159,7 +165,7 @@ class QuadhopperTargetEnv(gym.Env):
           9  vy_deficit      规划所需 vy - 实际 vy（支撑相有效，飞行相置零）
          10  dx_target       足端到当前目标的水平距离
          11  is_touching     接触标志 (0/1)
-         12  target_idx      当前目标序号
+         12  task_phase      保留维度，恒为 0（控制律不依赖绝对跳序号）
          13  theta_err_td    theta 与落地目标角 phi_td 之差
          14  stance_ratio    当前连续支撑步数 / 最大支撑步数 (0~1)
         """
@@ -201,7 +207,7 @@ class QuadhopperTargetEnv(gym.Env):
             vy_def,                                        # vy_deficit
             dx_target,                                     # dx_target
             is_touching,                                   # is_touching
-            float(self.current_target_idx),                # target_idx
+            0.0,                                           # task_phase (translation invariant)
             theta_err_td,                                  # theta error vs phi_td
             float(np.clip(stance_ratio, 0.0, 1.0)),        # stance_ratio
         ], dtype=np.float32)
@@ -240,6 +246,10 @@ class QuadhopperTargetEnv(gym.Env):
 
         com_pos  = self.physics.get_com_pos(self.q)
         com_vel  = self.physics.get_com_vel(self.q, self.dq)
+        self.hop_max_height = max(self.hop_max_height, float(com_pos[1]))
+        apex_event = (
+            (not touching) and self.prev_vy > 0.0 and float(com_vel[1]) <= 0.0
+        )
         foot_pos = self.physics.get_foot_pos(self.q)
 
         target_valid = self.current_target_idx < len(self.ecfg.targets)
@@ -267,7 +277,13 @@ class QuadhopperTargetEnv(gym.Env):
         )
 
         # 目标命中检测
-        if touching and com_vel[1] > -0.5 and target_valid:
+        if (
+            touching
+            and com_vel[1] > -0.5
+            and self.hop_max_height >= self.ecfg.min_target_hop_height
+            and self.hop_max_height <= self.ecfg.max_target_hop_height
+            and target_valid
+        ):
             if dist_to_target < self.ecfg.target_tolerance:
                 target_hit = True
                 if self.ecfg.print_hit_events:
@@ -280,6 +296,7 @@ class QuadhopperTargetEnv(gym.Env):
                     all_targets_done = True
                     terminated = True
                 else:
+                    self.hop_max_height = float(com_pos[1])
                     com_now = self.physics.get_com_pos(self.q)
                     self.planner.plan(
                         com_now[0], com_now[1],
@@ -313,6 +330,7 @@ class QuadhopperTargetEnv(gym.Env):
             touching=touching,
             touchdown_event=touchdown_event,
             liftoff_event=liftoff_event,
+            apex_event=apex_event,
             traj_valid=self.planner.valid,
             vx_nom=self.planner.vx_nom,
             vy_nom=self.planner.vy_nom,
@@ -332,6 +350,7 @@ class QuadhopperTargetEnv(gym.Env):
 
         self.steps += 1
         self.prev_touching = touching
+        self.prev_vy = float(com_vel[1])
         if self.steps >= self.ecfg.max_episode_steps:
             truncated = True
 

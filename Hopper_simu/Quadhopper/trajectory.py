@@ -23,6 +23,7 @@ class TrajectoryPlanner:
         self.b_local: float = 0.0
         self.x0: float = 0.0
         self.y0: float = 0.0
+        self.x_target_com: float = 0.0
         self.vx_nom: float = 0.0
         self.vy_nom: float = 0.0
         self.v0_min: float = 0.0
@@ -36,6 +37,7 @@ class TrajectoryPlanner:
         self.b_local = 0.0
         self.x0 = 0.0
         self.y0 = 0.0
+        self.x_target_com = 0.0
         self.vx_nom = 0.0
         self.vy_nom = 0.0
         self.v0_min = 0.0
@@ -125,6 +127,7 @@ class TrajectoryPlanner:
         self.b_local = vy_nom / vx_nom
         self.x0 = x_curr
         self.y0 = y_curr
+        self.x_target_com = x_target_com
         self.vx_nom = vx_nom
         self.vy_nom = vy_nom
         self.v0_min = v_min
@@ -144,7 +147,11 @@ class TrajectoryPlanner:
         if not self.valid:
             return 1.1, 0.0
 
-        dx = max(x_current - self.x0, 0.0)
+        # The parabola is only defined until the planned touchdown.  Clamping
+        # prevents diagnostic plots from extrapolating it below the ground
+        # after a missed target or while the robot is already in stance.
+        dx_end = max(self.x_target_com - self.x0, 0.0)
+        dx = float(np.clip(x_current - self.x0, 0.0, dx_end))
         y_ideal = self.a * dx ** 2 + self.b_local * dx + self.y0
         slope = 2.0 * self.a * dx + self.b_local
         vx_ref = self.vx_nom if self.vx_nom > 0.0 else max(v_x, 0.1)
