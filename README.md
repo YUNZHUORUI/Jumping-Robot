@@ -73,6 +73,30 @@ Energy and limit-cycle diagnostics during the 2D ballistic-launch experiments:
 |---|---|
 | ![](docs/images/ppo-energy-analysis.png) | ![](docs/images/ppo-limit-cycle.png) |
 
+#### CUDA five-hop training and diagnostics
+
+The planar QuadHopper can run its batched physics, rollout collection, GAE, and
+PPO updates entirely on an NVIDIA GPU. From `Hopper_simu`, train a five-target
+policy with:
+
+```powershell
+..\.venv\Scripts\python.exe -m Quadhopper.train --mode train --backend torch --device cuda --target-count 5 --timesteps 8000000 --model artifacts/models/ppo_quadhopper_v7_cuda_five_hop
+```
+
+Evaluate 512 parallel five-hop episodes before rendering a deterministic
+rollout:
+
+```powershell
+..\.venv\Scripts\python.exe -m Quadhopper.train --mode eval --backend torch --device cuda --target-count 5 --episodes 512 --model artifacts/models/ppo_quadhopper_v7_cuda_five_hop
+..\.venv\Scripts\python.exe -m Quadhopper.train --mode test --backend torch --device cuda --target-count 5 --test-steps 800 --model artifacts/models/ppo_quadhopper_v7_cuda_five_hop
+```
+
+The test command writes the animation, trajectory/thrust analysis, and
+mechanical-energy breakdown to `artifacts/renders/`. On machines without CUDA,
+keep the original Stable-Baselines3 path by selecting
+`--backend sb3 --device cpu`; `--backend auto` chooses the CUDA-native backend
+only when CUDA is available.
+
 ### 3D quad-rotor hopper (Isaac Sim, RSL-RL)
 
 > *Placeholder — GIF to be added.* Path will be `docs/images/isaac-hopper-jump.gif`.
