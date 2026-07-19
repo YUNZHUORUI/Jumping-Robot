@@ -40,6 +40,7 @@ class RewardInfo:
     landing_proximity: float = 0.0   # dense reward: foot lands near next target
     forward_progress: float = 0.0
     flight_height: float = 0.0
+    apex_height: float = 0.0
     flight_attitude: float = 0.0
     flight_thrust: float = 0.0
     target_hit: float = 0.0
@@ -75,6 +76,7 @@ class RewardFunction:
         touching: bool,
         touchdown_event: bool,
         liftoff_event: bool,
+        apex_event: bool = False,
         # 规划器目标（弹道所需速度）
         traj_valid: bool,
         vx_nom: float,
@@ -188,6 +190,13 @@ class RewardFunction:
                 -c.flight_attitude_sharpness * att_err
             )
             info.flight_thrust = -c.flight_thrust_penalty * (u1 + u2)
+
+        if apex_event:
+            apex_err = com_y - c.target_height
+            info.apex_height = c.apex_height_weight * math.exp(
+                -c.apex_height_sharpness * apex_err ** 2
+            )
+            info.apex_height -= c.apex_height_error_penalty * apex_err ** 2
 
         # ── 5. 目标命中 ────────────────────────────────────────────────────
         if target_hit:

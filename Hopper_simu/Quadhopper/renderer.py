@@ -169,11 +169,44 @@ class QuadhopperRenderer:
         fig, axes = plt.subplots(3, 1, figsize=(10, 11), sharex=True)
         ax1, ax2, ax3 = axes
 
+        # A spatial ballistic plan y(x) cannot be plotted directly against a
+        # time-step axis: variable horizontal speed creates an artificial phase
+        # shift.  For time-domain diagnostics, align one reference parabola to
+        # each measured flight interval and keep the requested apex height.
+        target_y = np.asarray(history['target_y'], dtype=np.float64)
+        reference_label = 'Planned arc height'
+        if 'touching' in history and len(history['touching']) == len(history['step']):
+            touching = np.asarray(history['touching'], dtype=bool)
+            measured_y = np.asarray(history['y'], dtype=np.float64)
+            phase_reference = np.full_like(measured_y, np.nan)
+            apex = float(history.get('target_height', 1.0))
+            i = 0
+            while i < len(touching):
+                if touching[i]:
+                    i += 1
+                    continue
+                j = i
+                while j < len(touching) and not touching[j]:
+                    j += 1
+                count = j - i
+                if count >= 2:
+                    phase = np.linspace(0.0, 1.0, count)
+                    baseline = ((1.0 - phase) * measured_y[i]
+                                + phase * measured_y[j - 1])
+                    endpoint_mid = 0.5 * (measured_y[i] + measured_y[j - 1])
+                    phase_reference[i:j] = (
+                        baseline
+                        + 4.0 * phase * (1.0 - phase) * (apex - endpoint_mid)
+                    )
+                i = j
+            target_y = phase_reference
+            reference_label = 'Phase-aligned target arc'
+
         ax1.plot(history['step'], history['y'],        'k-',  lw=1.5, label='COM height')
-        ax1.plot(history['step'], history['target_y'], 'r--', lw=1.2, alpha=0.7,
-                 label='Planned arc height')
+        ax1.plot(history['step'], target_y, 'r--', lw=1.2, alpha=0.7,
+                 label=reference_label)
         ax1.set_ylabel("Height (m)")
-        ax1.set_title("COM Height vs Planned Arc")
+        ax1.set_title("COM Height vs Phase-Aligned Target Arc")
         ax1.legend(); ax1.grid(True, alpha=0.4)
 
         ax2.plot(history['step'], history['theta'], 'g-', lw=1.5, label='θ (deg)')
@@ -196,4 +229,61 @@ class QuadhopperRenderer:
         Path(path).parent.mkdir(parents=True, exist_ok=True)
         plt.savefig(path, dpi=120)
         print(f"Analysis saved: {path}")
+        plt.close(fig)
+
+    @staticmethod
+    def save_energy_plot(history: Dict, path: str):
+        """Plot the mechanical-energy budget recorded during one rollout."""
+        required = {
+            'step', 'energy_translational', 'energy_rotational',
+            'energy_gravity', 'energy_spring', 'energy_total',
+        }
+        missing = required.difference(history)
+        if missing:
+            print(f"Energy plot skipped; missing history fields: {sorted(missing)}")
+            return
+
+        steps = np.asarray(history['step'])
+        fig, ax = plt.subplots(figsize=(11, 5.5))
+        ax.plot(steps, history['energy_translational'], lw=1.4,
+                label='Translational kinetic')
+        ax.plot(steps, history['energy_rotational'], lw=1.2,
+                label='Rotational kinetic')
+        ax.plot(steps, history['energy_gravity'], lw=1.4,
+                label='Gravitational potential')
+        ax.plot(steps, history['energy_spring'], lw=1.4,
+                label='Spring potential')
+        ax.plot(steps, history['energy_total'], 'k-', lw=2.0,
+                label='Total mechanical')
+
+        # Shaded intervals mark ground contact, where the spring stores energy
+        # and impact/damping losses occur. Flight intervals remain unshaded.
+        if 'touching' in history and len(history['touching']) == len(steps):
+            touching = np.asarray(history['touching'], dtype=bool)
+            in_span = False
+            stance_label_used = False
+            span_start = 0
+            for i, active in enumerate(touching):
+                if active and not in_span:
+                    span_start = i
+                    in_span = True
+                if in_span and (not active or i == len(touching) - 1):
+                    span_end = i if not active else i + 1
+                    ax.axvspan(
+                        steps[span_start], steps[min(span_end - 1, len(steps) - 1)],
+                        color='tab:gray', alpha=0.10,
+                        label='Stance' if not stance_label_used else None,
+                    )
+                    stance_label_used = True
+                    in_span = False
+
+        ax.set_title('Mechanical Energy During Repeated Hops')
+        ax.set_xlabel('Step')
+        ax.set_ylabel('Energy (J)')
+        ax.grid(True, alpha=0.35)
+        ax.legend(ncol=3)
+        fig.tight_layout()
+        Path(path).parent.mkdir(parents=True, exist_ok=True)
+        fig.savefig(path, dpi=140)
+        print(f"Energy analysis saved: {path}")
         plt.close(fig)

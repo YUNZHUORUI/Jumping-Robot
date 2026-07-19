@@ -47,7 +47,7 @@ class PhysicsConfig:
     # SLIP stance model.
     use_slip_stance: bool = True
     k_slip: float = 400.0          # N/m  ← Isaac: LEG_STIFFNESS = 400
-    c_slip: float = 4.0            # N·s/m  ↑ from 1.5: ζ≈0.25 for realistic landing absorption
+    c_slip: float = 1.5            # N·s/m  preserve landing energy for repeated hopping
     spring_preload: float = 1.8    # N    ↓ from 8.0: ≈robot weight so leg is neutral at rest.
     #   Old value (8 N = 4.5× weight) put equilibrium ABOVE natural length, causing
     #   ddl≈+42 m/s² even at l=l0, which triggered liftoff in the first stance step.
@@ -130,6 +130,8 @@ class EnvConfig:
         default_factory=lambda: make_even_targets(count=6, spacing=0.5)
     )
     target_tolerance: float = 0.15
+    min_target_hop_height: float = 0.90
+    max_target_hop_height: float = 1.15
     max_episode_steps: int = 1500     # 1500 × 0.01 s = 15 s
     obs_clip: float = 20.0
     print_hit_events: bool = True
@@ -138,7 +140,7 @@ class EnvConfig:
     # - "ground": start in stance from rest, for real target-jump feasibility tests.
     # - "ballistic": legacy curriculum start with planned initial velocity.
     reset_mode: str = "ground"
-    ground_init_leg_compression: float = 0.065
+    ground_init_leg_compression: float = 0.050
     ground_init_theta_min_deg: float = -6.0
     ground_init_theta_max_deg: float = 6.0
 
@@ -219,10 +221,13 @@ class RewardConfig:
     flight_attitude_weight: float = 2.0   # stronger signal: policy must control theta during flight
     flight_attitude_sharpness: float = 3.0
     flight_thrust_penalty: float = 0.15
-    flight_height_weight: float = 8.0
+    flight_height_weight: float = 1.0
     flight_height_sharpness: float = 6.0
     overheight_penalty_weight: float = 18.0
     target_height: float = 1.0
+    apex_height_weight: float = 50.0
+    apex_height_sharpness: float = 20.0
+    apex_height_error_penalty: float = 150.0
 
     # ── Dense progress shaping ────────────────────────────────────────────
     forward_progress_weight: float = 0.35
@@ -257,7 +262,26 @@ class TrainingConfig:
     batch_size: int = 256
     ent_coef: float = 0.02
     gamma: float = 0.995
+    # "auto" selects CUDA when the installed PyTorch build can use an NVIDIA
+    # GPU, otherwise Stable-Baselines3 keeps the original CPU training path.
     device: str = "auto"
+    cuda_allow_tf32: bool = True
+
+    # Native Torch CUDA backend.  Unlike SB3's VecEnv path, this keeps the
+    # physics state, rollout storage, GAE and PPO updates on the GPU.
+    backend: str = "auto"          # auto: torch on CUDA, SB3 on CPU
+    cuda_n_envs: int = 2048
+    cuda_rollout_steps: int = 128
+    cuda_batch_size: int = 8192
+    cuda_update_epochs: int = 10
+    cuda_hidden_size: int = 128
+    cuda_ent_coef: float = 0.001
+    cuda_vf_coef: float = 0.5
+    cuda_clip_range: float = 0.2
+    cuda_gae_lambda: float = 0.95
+    cuda_max_grad_norm: float = 0.5
+    cuda_log_std_init: float = -1.5
+    cuda_reward_scale: float = 0.01
 
 
 @dataclass
@@ -265,6 +289,7 @@ class RenderConfig:
     """Rendering and visualization settings."""
     gif_path: str = "artifacts/renders/quadhopper_v7_height_bounded_single.gif"
     plot_path: str = "artifacts/renders/thrust_analysis_v7_height_bounded_single.png"
+    energy_plot_path: str = "artifacts/renders/energy_analysis_v7_height_bounded_single.png"
     fps: int = 25
     render_every_n: int = 2
     fig_width: int = 12
