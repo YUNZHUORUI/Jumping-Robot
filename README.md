@@ -97,6 +97,17 @@ keep the original Stable-Baselines3 path by selecting
 `--backend sb3 --device cpu`; `--backend auto` chooses the CUDA-native backend
 only when CUDA is available.
 
+Five-hop rollout from the planar QuadHopper target-jumping task:
+
+<img src="docs/images/quadhopper-strict-five-hop.gif" alt="Planar QuadHopper five-hop target jumping rollout">
+
+The controller produces repeated stance-flight cycles with phase-aligned height
+tracking near the 1 m target arc and bounded body pitch:
+
+| Phase-aligned height / pitch / thrust | Mechanical energy over repeated hops |
+|---|---|
+| <img src="docs/images/quadhopper-phase-aligned-five-hop.png" alt="Phase-aligned COM height and thrust diagnostics for five repeated hops"> | <img src="docs/images/quadhopper-mechanical-energy-five-hop.png" alt="Mechanical energy breakdown during five repeated hops"> |
+
 ### 3D quad-rotor hopper (Isaac Sim, RSL-RL)
 
 > *Placeholder — GIF to be added.* Path will be `docs/images/isaac-hopper-jump.gif`.
