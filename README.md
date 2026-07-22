@@ -65,13 +65,13 @@ Dense reward composed of:
 
 Earlier milestone — PPO policy that times its release for an energy-efficient ballistic jump and stabilises landing attitude:
 
-![2D MuJoCo Hopper demo](docs/images/mujoco-hopper-2d.gif)
+![[./docs/images/mujoco-hopper-2d.gif|2D MuJoCo Hopper demo]]
 
 Energy and limit-cycle diagnostics during the 2D ballistic-launch experiments:
 
 | PPO energy use | PPO limit cycle |
 |---|---|
-| ![](docs/images/ppo-energy-analysis.png) | ![](docs/images/ppo-limit-cycle.png) |
+| ![[./docs/images/ppo-energy-analysis.png]] | ![[./docs/images/ppo-limit-cycle.png]] |
 
 #### CUDA five-hop training and diagnostics
 
