@@ -187,6 +187,7 @@
   },
   "active": "b70631ac4d2c60b3",
   "lastOpenFiles": [
+    "Jumping-Robot-Obd/Image/reactive_latch_hopping_robot_mechanism.png",
     "Hopper_simu/archive/test_SLIP.py",
     "Hopper_simu/archive/raibert_continue_jump.py",
     "Hopper_simu/archive/jumping_robotdynamics.py",
@@ -197,7 +198,6 @@
     "Hopper_simu/archive/dated_quadhopper_iterations/__pycache__/Quadhopper17-2-2026.cpython-39.pyc",
     "Hopper_simu/archive/dated_quadhopper_iterations/__pycache__/Quadhopper12_3.cpython-39.pyc",
     "Hopper_simu/archive/dated_quadhopper_iterations/__pycache__/Quadhopper12_25.cpython-39.pyc",
-    "Hopper_simu/archive/dated_quadhopper_iterations/__pycache__/Quadhopper12_23.cpython-39.pyc",
     "Hopper_simu/archive/dated_quadhopper_iterations/README.md",
     "docs/Isaac_Circular_Trajectory_Training_Plan.md",
     "Hopper_simu/artifacts/renders/quadhopper_strict_5_height_tight_energy.png",

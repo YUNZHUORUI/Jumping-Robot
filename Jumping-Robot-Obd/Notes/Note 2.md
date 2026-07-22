@@ -3,7 +3,7 @@
 ## Inspiration
 
 The idea is inspired by the recent hopping robot paper, which uses a spring-based actuation mechanism to preload elastic energy during flight and rapidly release it for the next jump.
-![[./image.png|alt text]]
+![[../Image/reactive_latch_hopping_robot_mechanism.png|Reactive latch hopping robot mechanism]]
 The paper demonstrates an efficient hopping mechanism by combining:
 
 - Motor-driven spring preload
