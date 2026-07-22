@@ -1,6 +1,6 @@
 # RL-Based Control for Hybrid Hopper Dynamics
 
-Reinforcement-learning control of an under-actuated **jumping robot** across two simulation stacks. The project starts from a 2D **MuJoCo** model that focuses on the **hybrid stance/flight dynamics** (energy-efficient ballistic launch + attitude stabilisation during the under-actuated flight phase), and is now being scaled up to **3D Isaac Sim** with thrust-driven actuation and domain randomisation for eventual sim-to-real transfer.
+Reinforcement-learning control of an under-actuated **jumping robot** across a staged simulation pipeline. The project starts from a 2D **hybrid stance/flight dynamics** model for target hopping and energy-flow analysis, then explores early 3D MuJoCo variants, and is now being scaled up in **3D Isaac Sim** with thrust-driven actuation and domain randomisation for eventual sim-to-real transfer.
 
 > **Latest milestone (May 2026):** Stable **in-place jumping** in Isaac Sim using PPO + restitution-based contact, with motor lag and per-environment physical-parameter randomisation. Policy keeps the body upright, holds horizontal position, and self-bounces from the ground without flying away.
 
@@ -13,8 +13,9 @@ The robot's locomotion is a **hybrid dynamical system**: an actuated stance phas
 
 ### Algorithm
 - **PPO** (Proximal Policy Optimisation) — clipped-objective actor-critic, on-policy
-  - 2D MuJoCo experiments: Stable-Baselines3
-  - 3D Isaac Sim experiments: **RSL-RL** with the Isaac Lab `DirectRLEnv` API
+  - 2D hybrid dynamics / planar QuadHopper: Stable-Baselines3 and CUDA-native PyTorch rollouts
+  - Early 3D MuJoCo experiments: Stable-Baselines3
+  - Active 3D Isaac Sim experiments: **RSL-RL** with the Isaac Lab `DirectRLEnv` API
 - Continuous action space, Gaussian policy
 - GAE advantage estimation; entropy bonus annealed during training
 
@@ -61,19 +62,7 @@ Dense reward composed of:
 
 ## Results
 
-### 2D hybrid hopper (MuJoCo, Stable-Baselines3)
-
-Earlier milestone — PPO policy that times its release for an energy-efficient ballistic jump and stabilises landing attitude:
-
-<img src="docs/images/mujoco-hopper-2d.gif" alt="2D MuJoCo Hopper demo">
-
-Energy and limit-cycle diagnostics during the 2D ballistic-launch experiments:
-
-| PPO energy use | PPO limit cycle |
-|---|---|
-| <img src="docs/images/ppo-energy-analysis.png" alt="PPO energy analysis"> | <img src="docs/images/ppo-limit-cycle.png" alt="PPO limit cycle"> |
-
-#### CUDA five-hop training and diagnostics
+### 2D hybrid dynamics QuadHopper
 
 The planar QuadHopper can run its batched physics, rollout collection, GAE, and
 PPO updates entirely on an NVIDIA GPU. From `Hopper_simu`, train a five-target
@@ -108,6 +97,19 @@ tracking near the 1 m target arc and bounded body pitch:
 |---|---|
 | <img src="docs/images/quadhopper-phase-aligned-five-hop.png" alt="Phase-aligned COM height and thrust diagnostics for five repeated hops"> | <img src="docs/images/quadhopper-mechanical-energy-five-hop.png" alt="Mechanical energy breakdown during five repeated hops"> |
 
+### Early 3D MuJoCo hopper variants
+
+Earlier milestone — PPO policy that times its release for an energy-efficient
+ballistic jump and stabilises landing attitude:
+
+<img src="docs/images/mujoco-hopper-2d.gif" alt="Early MuJoCo hopper demo">
+
+Energy and limit-cycle diagnostics during the ballistic-launch experiments:
+
+| PPO energy use | PPO limit cycle |
+|---|---|
+| <img src="docs/images/ppo-energy-analysis.png" alt="PPO energy analysis"> | <img src="docs/images/ppo-limit-cycle.png" alt="PPO limit cycle"> |
+
 ### 3D quad-rotor hopper (Isaac Sim, RSL-RL)
 
 > *Placeholder — GIF to be added.* Path will be `docs/images/isaac-hopper-jump.gif`.
@@ -132,7 +134,7 @@ Jumping-Robot/
 │   ├── Quadhopper_Isaac/    # env package: HopperEnvCfg, motor/thrust model, PPO cfg
 │   ├── train.py / play.py   # training & rollout entry points
 │   └── run_train.sh         # local Isaac Sim launcher
-├── Hopper_simu/             # 2D planar MuJoCo + SB3 experiments
+├── Hopper_simu/             # 2D planar hybrid-dynamics QuadHopper experiments
 ├── model-free-mujoco-RL/    # MuJoCo Quadhopper variants (fixed-point, vertical jump, etc.)
 ├── Jumping-Robot-Obd/       # earlier on-board / hardware-side notes
 ├── legacy-ppo-baseline/     # earliest working PPO Actor-Critic
@@ -141,8 +143,8 @@ Jumping-Robot/
 
 ## Stack
 
-- **Physics**: Isaac Sim 5.1 (Isaac Lab `DirectRLEnv`), MuJoCo
-- **RL**: RSL-RL PPO (3D), Stable-Baselines3 PPO (2D)
+- **Physics**: 2D hybrid dynamics, MuJoCo variants, Isaac Sim 5.1 (Isaac Lab `DirectRLEnv`)
+- **RL**: Stable-Baselines3 / CUDA-native PyTorch PPO (2D), RSL-RL PPO (Isaac)
 - **Tooling**: PyTorch, gymnasium, TensorBoard
 
 ---
