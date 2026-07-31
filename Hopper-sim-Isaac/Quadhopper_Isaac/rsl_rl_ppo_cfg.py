@@ -3,7 +3,7 @@ from isaaclab_rl.rsl_rl import RslRlOnPolicyRunnerCfg, RslRlPpoActorCriticCfg, R
 
 @configclass
 class HopperPPORunnerCfg(RslRlOnPolicyRunnerCfg):
-    num_steps_per_env = 128
+    num_steps_per_env = 256
     max_iterations = 1000
     save_interval = 100
     experiment_name = "myhopper"
@@ -34,7 +34,7 @@ class HopperPPORunnerCfg(RslRlOnPolicyRunnerCfg):
 
 @configclass
 class QuadcopterPPORunnerCfg(RslRlOnPolicyRunnerCfg):
-    num_steps_per_env = 128
+    num_steps_per_env = 256
     max_iterations = 1000
     save_interval = 100
     experiment_name = "myquadcopter"
