@@ -54,6 +54,16 @@ events.out.tfevents.*
 *.glb
 *.gltf
 
+# Reproducible higherjump hardware baseline required by Quadhopper_Gate.
+!Hopper-sim-Isaac/Quadhopper_Isaac/model/HopperAsset.usd
+!Hopper-sim-Isaac/Quadhopper_Isaac/model/quadhopper_memory_power.pt
+
+# Canonical stable-jump level-1 assets supplied by the user.
+!Hopper-sim-Isaac/Quadhopper_Stable/model/HopperAsset.usd
+!Hopper-sim-Isaac/Quadhopper_Stable/model/quadhopper_memory_power.pt
+!Hopper-sim-Isaac/Quadhopper_Stable/model/Jump Base.STL
+!Hopper-sim-Isaac/Quadhopper_Stable/model/Jump Leg.STL
+
 # ===== 调试输出 / 媒体 =====
 *.gif
 *.mp4

@@ -1,0 +1,4 @@
+interface:
+  display_name: "Quadhopper Baseline"
+  short_description: "复用跳跃机器人 Isaac Lab 模型与训练基线"
+  default_prompt: "使用 $quadhopper-baseline 基于现有跳跃机器人创建新任务，并保留模型与动力学基线。"
