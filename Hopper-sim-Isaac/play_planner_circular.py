@@ -9,11 +9,19 @@ from isaaclab.app import AppLauncher
 parser = argparse.ArgumentParser(description="Play planner-conditioned circular hopping")
 parser.add_argument("--checkpoint", type=str, default=None)
 parser.add_argument("--num_envs", type=int, default=1)
+parser.add_argument("--height_stage", choices=("low", "high", "alternate"), default="alternate")
+parser.add_argument("--height_high", type=float, default=1.0)
+parser.add_argument("--height_low", type=float, default=0.7)
 AppLauncher.add_app_launcher_args(parser)
 args_cli = parser.parse_args()
 
 PROJECT_DIR = Path(__file__).resolve().parent
-LOG_ROOT = PROJECT_DIR / "logs/rsl_rl/quadhopper_planner_circular_v10"
+EXPERIMENTS = {
+    "low": "quadhopper_planner_circular_v15_descend_to_070",
+    "high": "quadhopper_planner_circular_v15_high_100",
+    "alternate": "quadhopper_planner_circular_v15_alternate_070_100",
+}
+LOG_ROOT = PROJECT_DIR / "logs/rsl_rl" / EXPERIMENTS[args_cli.height_stage]
 
 
 def latest_checkpoint() -> Path | None:
@@ -58,6 +66,16 @@ def main():
     env_cfg.force_full_planner = True
     # Evaluation must expose policy quality rather than observation RNG.
     env_cfg.observation_noise_std = 0.0
+    env_cfg.alternate_target_heights = args_cli.height_stage == "alternate"
+    env_cfg.alternate_height_high = args_cli.height_high
+    env_cfg.alternate_height_low = args_cli.height_low
+    env_cfg.target_height = (
+        args_cli.height_low if args_cli.height_stage == "low" else args_cli.height_high
+    )
+    # Evaluation is always the final fixed command, never the training schedule.
+    env_cfg.fixed_height_curriculum = False
+    env_cfg.symmetric_height_tracking = True
+    env_cfg.require_apex_tolerance_for_hit = True
     env_cfg.power_model_path = str(PROJECT_DIR / "Quadhopper_Stable/model/quadhopper_memory_power.pt")
     env_cfg.csv_log_path = str(PROJECT_DIR / "outputs/planner_circular/on_quadhopper_sim.csv")
     env = RslRlVecEnvWrapper(gym.make("Quadhopper-Planner-Circular-Direct-v0", cfg=env_cfg))

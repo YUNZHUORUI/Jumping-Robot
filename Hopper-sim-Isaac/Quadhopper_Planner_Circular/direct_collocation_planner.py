@@ -4,30 +4,48 @@ import torch
 
 
 class DirectCollocationHopPlanner:
-    """Joint numerical planner for the next two complete jump cycles.
+    """Two-flight, state-dependent reference planner.
 
-    Both cycle trajectories are decision variables in one KKT system. Each
-    segment enforces takeoff, apex, landing and velocity constraints while the
-    objective minimizes third finite differences. The result is a rolling
-    two-cycle horizon, not a one-hop curve with P_(t+1) used only as a hint.
+    Heights are absolute root-Z commands at the apex.  Each flight duration is
+    computed from the measured takeoff/landing height and gravity.  The stance
+    phase is intentionally handled by the environment; this planner contains
+    flight only and therefore never pretends that ground contact is a smooth
+    continuation of a ballistic arc.
+
+    This is a kinematic collocation reference generator, not a full rigid-body
+    or contact optimizer.  Motor, spring and attitude feasibility is learned by
+    the tracking policy.
     """
 
-    def __init__(self, num_envs: int, device: str, nodes: int, duration: float):
+    def __init__(
+        self,
+        num_envs: int,
+        device: str,
+        nodes: int,
+        gravity: float = 9.81,
+        min_flight_duration: float = 0.30,
+        max_flight_duration: float = 1.10,
+    ):
         if nodes < 9 or nodes % 2 == 0:
             raise ValueError("planner_nodes must be an odd integer >= 9")
         self.num_envs = num_envs
         self.device = device
         self.nodes = nodes
-        self.duration = float(duration)
-        self.dt = self.duration / (nodes - 1)
+        self.gravity = float(gravity)
+        self.min_flight_duration = float(min_flight_duration)
+        self.max_flight_duration = float(max_flight_duration)
         self.mid = nodes // 2
         self.positions_w = torch.zeros(num_envs, nodes, 3, device=device)
         self.velocities_w = torch.zeros_like(self.positions_w)
         self.next_positions_w = torch.zeros_like(self.positions_w)
         self.next_velocities_w = torch.zeros_like(self.positions_w)
-        self._kkt = self._build_joint_kkt(device)
+        self.flight_duration = torch.full(
+            (num_envs,), self.min_flight_duration, device=device
+        )
+        self.next_flight_duration = self.flight_duration.clone()
+        self._hessian = self._build_hessian(device)
 
-    def _segment_hessian_and_constraints(self, device: str) -> tuple[torch.Tensor, torch.Tensor]:
+    def _build_hessian(self, device: str) -> torch.Tensor:
         n = self.nodes
         d3 = torch.zeros(n - 3, n, device=device)
         row = torch.arange(n - 3, device=device)
@@ -35,35 +53,67 @@ class DirectCollocationHopPlanner:
         d3[row, row + 1] = 3.0
         d3[row, row + 2] = -3.0
         d3[row, row + 3] = 1.0
-        hessian = d3.T @ d3 + 1.0e-5 * torch.eye(n, device=device)
+        return d3.T @ d3 + 1.0e-5 * torch.eye(n, device=device)
 
-        constraints = torch.zeros(6, n, device=device)
-        constraints[0, 0] = 1.0
-        constraints[1, self.mid] = 1.0
-        constraints[2, -1] = 1.0
-        constraints[3, 0:2] = torch.tensor([-1.0, 1.0], device=device) / self.dt
-        constraints[4, self.mid - 1 : self.mid + 2] = (
-            torch.tensor([-0.5, 0.0, 0.5], device=device) / self.dt
+    def _duration(
+        self, takeoff_z: torch.Tensor, apex_z: torch.Tensor, landing_z: torch.Tensor
+    ) -> torch.Tensor:
+        rise = (apex_z - takeoff_z).clamp_min(0.02)
+        fall = (apex_z - landing_z).clamp_min(0.02)
+        duration = torch.sqrt(2.0 * rise / self.gravity) + torch.sqrt(
+            2.0 * fall / self.gravity
         )
-        constraints[5, -2:] = torch.tensor([-1.0, 1.0], device=device) / self.dt
-        return hessian, constraints
+        return duration.clamp(self.min_flight_duration, self.max_flight_duration)
 
-    def _build_joint_kkt(self, device: str) -> torch.Tensor:
-        hessian, constraints = self._segment_hessian_and_constraints(device)
-        joint_hessian = torch.block_diag(hessian, hessian)
-        joint_constraints = torch.block_diag(constraints, constraints)
-        top = torch.cat((joint_hessian, joint_constraints.T), dim=1)
-        bottom = torch.cat(
-            (joint_constraints, torch.zeros(12, 12, device=device)), dim=1
+    def _constraints(self, duration: torch.Tensor) -> torch.Tensor:
+        batch = len(duration)
+        dt = duration / float(self.nodes - 1)
+        constraints = torch.zeros(batch, 6, self.nodes, device=self.device)
+        constraints[:, 0, 0] = 1.0
+        constraints[:, 1, self.mid] = 1.0
+        constraints[:, 2, -1] = 1.0
+        constraints[:, 3, 0] = -1.0 / dt
+        constraints[:, 3, 1] = 1.0 / dt
+        constraints[:, 4, self.mid - 1] = -0.5 / dt
+        constraints[:, 4, self.mid + 1] = 0.5 / dt
+        constraints[:, 5, -2] = -1.0 / dt
+        constraints[:, 5, -1] = 1.0 / dt
+        return constraints
+
+    def _solve_segment(
+        self,
+        duration: torch.Tensor,
+        start: torch.Tensor,
+        apex: torch.Tensor,
+        landing: torch.Tensor,
+        start_velocity: torch.Tensor,
+        apex_velocity: torch.Tensor,
+        landing_velocity: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        batch = len(duration)
+        constraints = self._constraints(duration)
+        hessian = self._hessian.expand(batch, -1, -1)
+        zeros = torch.zeros(batch, 6, 6, device=self.device)
+        kkt = torch.cat(
+            (
+                torch.cat((hessian, constraints.transpose(1, 2)), dim=2),
+                torch.cat((constraints, zeros), dim=2),
+            ),
+            dim=1,
         )
-        return torch.cat((top, bottom), dim=0)
+        boundary = torch.stack(
+            (start, apex, landing, start_velocity, apex_velocity, landing_velocity), dim=1
+        )
+        rhs = torch.zeros(batch, self.nodes + 6, 3, device=self.device)
+        rhs[:, self.nodes :, :] = boundary
+        positions = torch.linalg.solve(kkt, rhs)[:, : self.nodes, :]
 
-    def _finite_difference_velocity(self, positions: torch.Tensor) -> torch.Tensor:
+        dt = duration[:, None, None] / float(self.nodes - 1)
         velocity = torch.zeros_like(positions)
-        velocity[:, 1:-1] = (positions[:, 2:] - positions[:, :-2]) / (2.0 * self.dt)
-        velocity[:, 0] = (positions[:, 1] - positions[:, 0]) / self.dt
-        velocity[:, -1] = (positions[:, -1] - positions[:, -2]) / self.dt
-        return velocity
+        velocity[:, 1:-1] = (positions[:, 2:] - positions[:, :-2]) / (2.0 * dt)
+        velocity[:, 0] = (positions[:, 1] - positions[:, 0]) / dt[:, 0]
+        velocity[:, -1] = (positions[:, -1] - positions[:, -2]) / dt[:, 0]
+        return positions, velocity
 
     def replan(
         self,
@@ -74,25 +124,27 @@ class DirectCollocationHopPlanner:
         p_t1_xy_w: torch.Tensor,
         target_height_w: torch.Tensor,
         landing_height_w: torch.Tensor,
+        next_target_height_w: torch.Tensor | None = None,
     ):
         if len(env_ids) == 0:
             return
+        if next_target_height_w is None:
+            next_target_height_w = target_height_w
 
-        first_delta = p_t_xy_w - start_pos_w[:, :2]
-        second_delta = p_t1_xy_w - p_t_xy_w
-        first_speed = torch.linalg.norm(first_delta, dim=1) / self.duration
-        second_distance = torch.linalg.norm(second_delta, dim=1)
-        second_direction = second_delta / second_distance[:, None].clamp_min(1.0e-6)
-        tangent_speed = 0.5 * (first_speed + second_distance / self.duration)
-        tangent_v = second_direction * tangent_speed[:, None]
-
-        jump_speed = torch.sqrt(
-            2.0 * 9.81 * (target_height_w - landing_height_w).clamp_min(0.02)
+        duration = self._duration(start_pos_w[:, 2], target_height_w, landing_height_w)
+        next_duration = self._duration(
+            landing_height_w, next_target_height_w, landing_height_w
         )
-        zero_z = torch.zeros(len(env_ids), 1, device=self.device)
-        upward_v = torch.cat((tangent_v, jump_speed[:, None]), dim=1)
-        apex_v = torch.cat((tangent_v, zero_z), dim=1)
-        landing_v = torch.cat((tangent_v, -jump_speed[:, None]), dim=1)
+        first_xy_velocity = (p_t_xy_w - start_pos_w[:, :2]) / duration[:, None]
+        second_xy_velocity = (p_t1_xy_w - p_t_xy_w) / next_duration[:, None]
+        first_rise = (target_height_w - start_pos_w[:, 2]).clamp_min(0.02)
+        first_fall = (target_height_w - landing_height_w).clamp_min(0.02)
+        next_rise = (next_target_height_w - landing_height_w).clamp_min(0.02)
+        first_up = torch.sqrt(2.0 * self.gravity * first_rise)
+        first_down = torch.sqrt(2.0 * self.gravity * first_fall)
+        next_up = torch.sqrt(2.0 * self.gravity * next_rise)
+        next_down = next_up
+        zero = torch.zeros(len(env_ids), 1, device=self.device)
 
         p_t_ground = torch.cat((p_t_xy_w, landing_height_w[:, None]), dim=1)
         p_t1_ground = torch.cat((p_t1_xy_w, landing_height_w[:, None]), dim=1)
@@ -100,31 +152,47 @@ class DirectCollocationHopPlanner:
             (0.5 * (start_pos_w[:, :2] + p_t_xy_w), target_height_w[:, None]), dim=1
         )
         apex_t1 = torch.cat(
-            (0.5 * (p_t_xy_w + p_t1_xy_w), target_height_w[:, None]), dim=1
+            (0.5 * (p_t_xy_w + p_t1_xy_w), next_target_height_w[:, None]), dim=1
         )
+        first_takeoff_v = torch.cat((first_xy_velocity, first_up[:, None]), dim=1)
+        # Use measured velocity only when already airborne; at grounded replans
+        # the physically meaningful boundary is the required takeoff velocity.
+        airborne = start_pos_w[:, 2] > landing_height_w + 0.03
+        first_start_v = torch.where(airborne[:, None], start_vel_w, first_takeoff_v)
+        first_apex_v = torch.cat((first_xy_velocity, zero), dim=1)
+        first_landing_v = torch.cat((first_xy_velocity, -first_down[:, None]), dim=1)
+        next_takeoff_v = torch.cat((second_xy_velocity, next_up[:, None]), dim=1)
+        next_apex_v = torch.cat((second_xy_velocity, zero), dim=1)
+        next_landing_v = torch.cat((second_xy_velocity, -next_down[:, None]), dim=1)
 
-        first_boundary = torch.stack(
-            (start_pos_w, apex_t, p_t_ground, start_vel_w, apex_v, landing_v), dim=1
+        first_pos, first_vel = self._solve_segment(
+            duration,
+            start_pos_w,
+            apex_t,
+            p_t_ground,
+            first_start_v,
+            first_apex_v,
+            first_landing_v,
         )
-        second_boundary = torch.stack(
-            (p_t_ground, apex_t1, p_t1_ground, upward_v, apex_v, landing_v), dim=1
+        next_pos, next_vel = self._solve_segment(
+            next_duration,
+            p_t_ground,
+            apex_t1,
+            p_t1_ground,
+            next_takeoff_v,
+            next_apex_v,
+            next_landing_v,
         )
-        joint_boundary = torch.cat((first_boundary, second_boundary), dim=1)
+        self.positions_w[env_ids] = first_pos
+        self.velocities_w[env_ids] = first_vel
+        self.next_positions_w[env_ids] = next_pos
+        self.next_velocities_w[env_ids] = next_vel
+        self.flight_duration[env_ids] = duration
+        self.next_flight_duration[env_ids] = next_duration
 
-        decision_count = 2 * self.nodes
-        rhs = torch.zeros(len(env_ids), decision_count + 12, 3, device=self.device)
-        rhs[:, decision_count:, :] = joint_boundary
-        solution = torch.linalg.solve(self._kkt, rhs)
-        first_positions = solution[:, : self.nodes, :]
-        second_positions = solution[:, self.nodes : decision_count, :]
-
-        self.positions_w[env_ids] = first_positions
-        self.velocities_w[env_ids] = self._finite_difference_velocity(first_positions)
-        self.next_positions_w[env_ids] = second_positions
-        self.next_velocities_w[env_ids] = self._finite_difference_velocity(second_positions)
-
-    def sample(self, cycle_time: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        phase = (cycle_time / self.duration).clamp(0.0, 1.0) * (self.nodes - 1)
+    def sample(self, flight_time: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        phase = (flight_time / self.flight_duration.clamp_min(1.0e-6)).clamp(0.0, 1.0)
+        phase = phase * (self.nodes - 1)
         lower = torch.floor(phase).long().clamp(max=self.nodes - 2)
         blend = (phase - lower.float()).unsqueeze(-1)
         env_ids = torch.arange(self.num_envs, device=self.device)

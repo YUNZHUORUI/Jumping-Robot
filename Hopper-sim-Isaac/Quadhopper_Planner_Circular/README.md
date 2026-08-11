@@ -1,8 +1,56 @@
 # Planner-conditioned circular hopping
 
+## Version 15: first learn a fixed 0.70 m gait
+
+Version 15 keeps the proven circular trajectory task fixed and changes only
+one variable at a time. Starting from v10, the absolute apex command follows a
+300-iteration cosine curriculum from 1.30 m down to 0.70 m. This preserves the
+working horizontal/circular gait while the controller learns progressively
+lower spring/thrust timing. Variable-height training must not start until a
+fixed 0.70 m checkpoint completes the circle reliably.
+
+The policy uses a 43-D
+command-conditioned policy: stable 37 dimensions, body-frame XY errors to
+`P_t` and `P_(t+1)`, then absolute root-apex commands `H_t/2` and `H_(t+1)/2`.
+At the nominal grounded root height of 0.38 m, 0.70 m is a 0.32 m rise (close
+to the old circular task) and 1.00 m is a 0.62 m rise.
+
+The collocation reference now covers flight only. Its duration is computed
+from measured takeoff height, requested apex, landing height, and gravity.
+Ground contact/stance is a separate phase with a grounded, zero-velocity
+reference. This remains a kinematic reference planner; PPO handles spring,
+contact, motor lag, attitude, and thrust feasibility.
+
+Train strictly in order and inspect each stage before advancing:
+
+```bash
+bash run_train_variable_height.sh low 64 --iterations 300 \
+  --checkpoint logs/rsl_rl/quadhopper_planner_circular_v10/2026-08-06_11-10-23/model_518.pt
+
+bash run_train_variable_height.sh high 64 --iterations 20 \
+  --checkpoint logs/rsl_rl/quadhopper_planner_circular_v15_descend_to_070/<run>/model_<N>.pt
+
+bash run_train_variable_height.sh alternate 64 --iterations 20 \
+  --checkpoint logs/rsl_rl/quadhopper_planner_circular_v15_high_100/<run>/model_<N>.pt
+```
+
+Use `--resume_optimizer` only to continue the same stage. Cross-stage transfer
+resets optimizer state and action standard deviation. Playback uses
+`play_planner_circular.py --height_stage low|high|alternate --checkpoint ...`.
+
+TensorBoard can be launched with:
+
+```bash
+/home/terry/Documents/isaacsim/isaac-sim-standalone-5.1.0-linux-x86_64/python.sh \
+  -m tensorboard.main --logdir logs/rsl_rl --port 6006
+```
+
 This is the next curriculum level after `Quadhopper_Stable`. It does not reuse the old hand-authored ballistic/parabolic reference from `Hopper_Circular_Trajectory_Isaac`.
 
-Current milestone, checkpoint, version history, commands, and handoff context are recorded in [STAGE_SUMMARY_V10.md](STAGE_SUMMARY_V10.md). Read it before extending this task or starting ring traversal.
+The accepted fixed-height circular baseline is recorded in
+[STAGE_SUMMARY_V10.md](STAGE_SUMMARY_V10.md). The attempted low/variable-height
+extension, including failed checkpoints that must not be reused, is recorded in
+[STAGE_SUMMARY_V15.md](STAGE_SUMMARY_V15.md). Read both before continuing.
 
 ## Contract
 
@@ -48,3 +96,33 @@ Playback automatically selects the newest task checkpoint:
 ```bash
 /home/terry/Documents/isaacsim/isaac-sim-standalone-5.1.0-linux-x86_64/python.sh play_planner_circular.py
 ```
+
+Experimental alternating-height playback keeps the v10 42-D checkpoint
+contract. The first and second optimized cycles use separate apex commands,
+and the policy observes the command for its current hop:
+
+```bash
+/home/terry/Documents/isaacsim/isaac-sim-standalone-5.1.0-linux-x86_64/python.sh \
+  play_planner_circular.py --alternate_heights --height_high 1.0 --height_low 0.7
+```
+
+This tests zero-shot height generalization of a policy trained at `1.30 m`;
+it is not evidence that the model has learned the full height range. Train a
+separate curriculum before treating variable-height tracking as a completed
+capability.
+
+Variable-height v11 training starts from the accepted nominal v10 model but
+uses a new log namespace and resets the optimizer and action std. Vectorized
+environments randomize whether their first command is high or low, then
+alternate the two heights after each successful landing:
+
+```bash
+bash run_train_planner_circular.sh 64 \
+  --iterations 500 \
+  --checkpoint logs/rsl_rl/quadhopper_planner_circular_v10/2026-08-06_11-10-23/model_518.pt \
+  --alternate_heights --height_high 1.0 --height_low 0.7
+```
+
+The output is isolated under
+`logs/rsl_rl/quadhopper_planner_circular_v11_variable_height`. Resume a v11
+checkpoint with the same flags to restore its optimizer exactly.
