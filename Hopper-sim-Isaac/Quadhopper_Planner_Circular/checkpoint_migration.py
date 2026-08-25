@@ -13,6 +13,26 @@ RECURRENT_INPUT_KEYS = ("memory_a.rnn.weight_ih_l0", "memory_c.rnn.weight_ih_l0"
 LEGACY_FIXED_HEIGHT_COMMAND = 1.30 / 2.0
 
 
+def absolute_next_to_relative_state_dict(
+    state_dict: dict[str, torch.Tensor],
+) -> dict[str, torch.Tensor]:
+    """Preserve LSTM outputs when Pt1_abs is replaced by Pt1-Pt.
+
+    The planner command columns are [Pt_x, Pt_y, Pt1_x, Pt1_y] at indices
+    37:41.  Since Pt1_abs = Pt + next_delta, folding the old Pt1 weights
+    into the Pt weights makes the observation change algebraically exact.
+    """
+    converted = deepcopy(state_dict)
+    for key in RECURRENT_INPUT_KEYS:
+        weight = converted[key]
+        if weight.shape[1] != NEW_OBS_DIM:
+            raise ValueError(
+                f"{key} has observation width {weight.shape[1]}, expected {NEW_OBS_DIM}"
+            )
+        weight[:, 37:39] = weight[:, 37:39] + weight[:, 39:41]
+    return converted
+
+
 def migrate_stable_checkpoint(source: str | Path, destination: str | Path) -> Path:
     """Expand 37-D/42-D recurrent inputs to the 43-D height-horizon contract."""
     source = Path(source).expanduser().resolve()

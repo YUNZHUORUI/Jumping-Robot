@@ -125,11 +125,18 @@ class DirectCollocationHopPlanner:
         target_height_w: torch.Tensor,
         landing_height_w: torch.Tensor,
         next_target_height_w: torch.Tensor | None = None,
+        landing_xy_velocity_scale: float = 1.0,
+        anticipatory_velocity_blend: float = 0.0,
+        anticipatory_speed_max: float = 0.30,
     ):
         if len(env_ids) == 0:
             return
         if next_target_height_w is None:
             next_target_height_w = target_height_w
+        if not 0.0 <= anticipatory_velocity_blend <= 1.0:
+            raise ValueError("anticipatory_velocity_blend must be in [0, 1]")
+        if anticipatory_speed_max <= 0.0:
+            raise ValueError("anticipatory_speed_max must be positive")
 
         duration = self._duration(start_pos_w[:, 2], target_height_w, landing_height_w)
         next_duration = self._duration(
@@ -160,10 +167,24 @@ class DirectCollocationHopPlanner:
         airborne = start_pos_w[:, 2] > landing_height_w + 0.03
         first_start_v = torch.where(airborne[:, None], start_vel_w, first_takeoff_v)
         first_apex_v = torch.cat((first_xy_velocity, zero), dim=1)
-        first_landing_v = torch.cat((first_xy_velocity, -first_down[:, None]), dim=1)
+        next_speed = torch.linalg.norm(second_xy_velocity, dim=1, keepdim=True)
+        anticipated_xy_velocity = second_xy_velocity * torch.clamp(
+            anticipatory_speed_max / next_speed.clamp_min(1.0e-6), max=1.0
+        )
+        first_landing_xy_velocity = (
+            (1.0 - anticipatory_velocity_blend)
+            * landing_xy_velocity_scale
+            * first_xy_velocity
+            + anticipatory_velocity_blend * anticipated_xy_velocity
+        )
+        first_landing_v = torch.cat(
+            (first_landing_xy_velocity, -first_down[:, None]), dim=1
+        )
         next_takeoff_v = torch.cat((second_xy_velocity, next_up[:, None]), dim=1)
         next_apex_v = torch.cat((second_xy_velocity, zero), dim=1)
-        next_landing_v = torch.cat((second_xy_velocity, -next_down[:, None]), dim=1)
+        next_landing_v = torch.cat(
+            (landing_xy_velocity_scale * second_xy_velocity, -next_down[:, None]), dim=1
+        )
 
         first_pos, first_vel = self._solve_segment(
             duration,

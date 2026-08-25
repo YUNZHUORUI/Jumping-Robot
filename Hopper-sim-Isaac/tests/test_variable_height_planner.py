@@ -72,6 +72,38 @@ class VariableHeightPlannerTest(unittest.TestCase):
             expected_bias = source_bias + source_weight[:, 41] * 0.65
             torch.testing.assert_close(migrated_bias, expected_bias)
 
+    def test_anticipatory_terminal_velocity_points_toward_next_hop(self):
+        planner = DirectCollocationHopPlanner(1, "cpu", 25)
+        ids = torch.arange(1)
+        start = torch.tensor([[0.0, 0.0, 0.38]])
+        velocity = torch.zeros(1, 3)
+        p_t = torch.tensor([[0.70, 0.0]])
+        p_t1 = torch.tensor([[0.70, 0.90]])
+        height = torch.tensor([1.0])
+        landing = torch.tensor([0.38])
+        planner.replan(
+            ids,
+            start,
+            velocity,
+            p_t,
+            p_t1,
+            height,
+            landing,
+            height,
+            1.0,
+            1.0,
+            0.30,
+        )
+        torch.testing.assert_close(
+            planner.velocities_w[0, -1, :2],
+            torch.tensor([0.0, 0.30]),
+            atol=2.0e-3,
+            rtol=0.0,
+        )
+        torch.testing.assert_close(
+            planner.positions_w[0, -1, :2], p_t[0], atol=2.0e-4, rtol=0.0
+        )
+
 
 if __name__ == "__main__":
     unittest.main()
