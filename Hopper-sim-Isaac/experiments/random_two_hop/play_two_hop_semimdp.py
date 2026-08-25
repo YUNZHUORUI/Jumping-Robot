@@ -20,12 +20,20 @@ parser.add_argument("--max_steps", type=int, default=None)
 parser.add_argument("--target_tolerance", type=float, default=0.10)
 parser.add_argument("--action_offset", type=str, default=None,
                     help="Comma-separated 4 values added to the selected policy action")
+parser.add_argument("--short_action_offset", type=str, default=None,
+                    help="Comma-separated 4 values added only to short-hop policy actions")
+parser.add_argument("--long_action_offset", type=str, default=None,
+                    help="Comma-separated 4 values added only to long-hop policy actions")
 parser.add_argument("--action_scorer", default=None,
                     help="Optional learned scorer used to select long-hop candidate actions")
 parser.add_argument("--first_action_scorer", default=None,
                     help="Optional learned scorer used to select short-hop candidate actions")
 parser.add_argument("--scorer_quality_weight", type=float, default=0.0,
                     help="Weight of dense quality prediction in candidate ranking")
+parser.add_argument("--scorer_threshold_override", type=float, default=None,
+                    help="Override the second-hop scorer's saved selection threshold")
+parser.add_argument("--first_scorer_threshold_override", type=float, default=None,
+                    help="Override the first-hop scorer's saved selection threshold")
 parser.add_argument("--short_radius_min", type=float, default=0.50)
 parser.add_argument("--short_radius_max", type=float, default=0.80)
 parser.add_argument("--long_radius_min", type=float, default=0.80)
@@ -44,11 +52,18 @@ if not (0.0 < args.short_radius_min <= args.short_radius_max):
     parser.error("--short_radius_min/max must satisfy 0 < min <= max")
 if not (0.0 < args.long_radius_min <= args.long_radius_max):
     parser.error("--long_radius_min/max must satisfy 0 < min <= max")
-action_offset_arg = None
-if args.action_offset is not None:
-    action_offset_arg = [float(x) for x in args.action_offset.split(",")]
-    if len(action_offset_arg) != 4:
-        parser.error("--action_offset expects 4 comma-separated values")
+def parse_action_offset(value: str | None, name: str) -> list[float] | None:
+    if value is None:
+        return None
+    parsed = [float(x) for x in value.split(",")]
+    if len(parsed) != 4:
+        parser.error(f"{name} expects 4 comma-separated values")
+    return parsed
+
+
+action_offset_arg = parse_action_offset(args.action_offset, "--action_offset")
+short_action_offset_arg = parse_action_offset(args.short_action_offset, "--short_action_offset")
+long_action_offset_arg = parse_action_offset(args.long_action_offset, "--long_action_offset")
 app_launcher = AppLauncher(args)
 simulation_app = app_launcher.app
 
@@ -221,6 +236,8 @@ def main():
         scorer.eval()
         scorer_offsets = scorer_data["candidate_offsets"].to(args.device)
         scorer_threshold = float(scorer_data.get("selection_threshold", 0.0))
+        if args.scorer_threshold_override is not None:
+            scorer_threshold = args.scorer_threshold_override
     first_scorer = None
     first_scorer_offsets = None
     first_scorer_threshold = 0.0
@@ -231,9 +248,21 @@ def main():
         first_scorer.eval()
         first_scorer_offsets = first_data["candidate_offsets"].to(args.device)
         first_scorer_threshold = float(first_data.get("selection_threshold", 0.0))
+        if args.first_scorer_threshold_override is not None:
+            first_scorer_threshold = args.first_scorer_threshold_override
     action_offset = (
         torch.tensor(action_offset_arg, device=args.device)
         if action_offset_arg is not None
+        else None
+    )
+    short_action_offset = (
+        torch.tensor(short_action_offset_arg, device=args.device)
+        if short_action_offset_arg is not None
+        else None
+    )
+    long_action_offset = (
+        torch.tensor(long_action_offset_arg, device=args.device)
+        if long_action_offset_arg is not None
         else None
     )
 
@@ -271,6 +300,12 @@ def main():
         )
         if action_offset is not None:
             action = action + action_offset
+        short_hop = observations[:, -3:-2] > 0.5
+        long_hop = observations[:, -2:-1] > 0.5
+        if short_action_offset is not None:
+            action = torch.where(short_hop, action + short_action_offset, action)
+        if long_action_offset is not None:
+            action = torch.where(long_hop, action + long_action_offset, action)
         return action.clamp(-1.0, 1.0)
 
     obs_dict, _ = env.reset()
@@ -288,6 +323,8 @@ def main():
         f"[PLAY] queue={'pair-restart' if args.pair_restart_queue else 'continuous'} "
         f"correction={args.correction_mode} motor_limit={args.motor_correction_limit:.3f} "
         f"action_offset={args.action_offset or 'none'} "
+        f"short_action_offset={args.short_action_offset or 'none'} "
+        f"long_action_offset={args.long_action_offset or 'none'} "
         f"second_scorer={args.action_scorer or 'none'} first_scorer={args.first_action_scorer or 'none'}",
         flush=True,
     )

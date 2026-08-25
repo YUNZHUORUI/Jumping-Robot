@@ -316,3 +316,68 @@ Key training flags:
 --attitude_feedback_gain 0.100
 --landing_correction_height 0.20
 ```
+
+## 2026-08-25 Precision Follow-Up
+
+Comparable 500-env baseline for the saved short/medium model:
+
+```text
+checkpoint:
+saved_checkpoints/v57_short020_050_long050_080_balanced/model_466.pt
+
+eval flags:
+--eval_steps 3000 --num_envs 500 --curriculum_iterations 0
+--target_tolerance 0.10
+--short_radius_min 0.2 --short_radius_max 0.5
+--long_radius_min 0.5 --long_radius_max 0.8
+
+target_hit_rate                   0.681428
+touchdown_error_m                 0.084122
+max_consecutive_hits              6.626000
+conditional_second_hit_rate       0.758806
+two_hop_pair_success_rate         0.477378
+prepared_landing_rate             0.458167
+short_hit_rate                    0.628929
+short_touchdown_error_m           0.090069
+long_hit_rate                     0.734380
+long_touchdown_error_m            0.078123
+```
+
+Static short-hop offset grid did not produce a large gain. The only candidate
+that survived a direct 500-env eval was:
+
+```text
+--short_action_offset=0.24,0,-0.12,0
+
+target_hit_rate                   0.680934
+touchdown_error_m                 0.083896
+max_consecutive_hits              6.880000
+conditional_second_hit_rate       0.759484
+two_hop_pair_success_rate         0.480462
+prepared_landing_rate             0.459571
+short_hit_rate                    0.632012
+short_touchdown_error_m           0.089912
+long_hit_rate                     0.730308
+long_touchdown_error_m            0.077824
+```
+
+This is a tiny but real improvement over baseline under the same evaluation
+settings. Use it only as an A/B visualization/deployment option; keep
+`model_466.pt` as the main checkpoint.
+
+Two PPO fine-tune attempts from `model_466.pt` were stopped or rejected:
+
+```text
+logs/rsl_rl/quadhopper_planner_random_two_hop_v57_landing_prep_continuous_queue_semimdp_ppo/2026-08-25_23-44-34
+  dynamics-randomized short-precision PPO; model_467 direct eval worsened:
+  target_hit_rate 0.669837, error 0.085164, pair 0.457948
+
+logs/rsl_rl/quadhopper_planner_random_two_hop_v57_landing_prep_continuous_queue_semimdp_ppo/2026-08-25_23-52-00
+  nominal short-precision PPO with --disable_train_randomization;
+  model_467 direct eval worsened:
+  target_hit_rate 0.675222, error 0.084820, pair 0.464297
+```
+
+Conclusion: do not keep training PPO blindly from `model_466.pt` with the
+current reward variants. For now the safest model remains `model_466.pt`; the
+smallest deployable precision tweak is the short-hop runtime offset above.

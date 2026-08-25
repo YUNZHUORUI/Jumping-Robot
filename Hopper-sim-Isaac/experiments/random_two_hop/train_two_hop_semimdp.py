@@ -28,8 +28,14 @@ parser.add_argument("--offset_grid_search", action="store_true",
                     help="Evaluate a 5x5 forward/tilt offset grid around the loaded policy")
 parser.add_argument("--offset_grid_span", type=float, default=0.12,
                     help="Half-width of --offset_grid_search in normalized action units")
+parser.add_argument("--offset_grid_phase", choices=("all", "short", "long"), default="all",
+                    help="Apply --offset_grid_search offsets to all, short-hop, or long-hop actions")
 parser.add_argument("--action_offset", type=str, default=None,
                     help="Comma-separated 4 values added to the selected policy action at eval time")
+parser.add_argument("--short_action_offset", type=str, default=None,
+                    help="Comma-separated 4 values added only to short-hop policy actions")
+parser.add_argument("--long_action_offset", type=str, default=None,
+                    help="Comma-separated 4 values added only to long-hop policy actions")
 parser.add_argument("--constant_forward", type=float, default=None)
 parser.add_argument("--constant_tilt", type=float, default=None)
 parser.add_argument("--num_envs", type=int, default=256)
@@ -52,6 +58,8 @@ parser.add_argument("--std_end", type=float, default=0.01, help="Final action st
 parser.add_argument("--gamma_frame", type=float, default=0.999, help="Per-frame discount inside a hop")
 parser.add_argument("--anchor_scale", type=float, default=0.05, help="Weight of the zero-action anchor in the PPO loss")
 parser.add_argument("--progress_log_every", type=int, default=300, help="Print rollout progress every N frames")
+parser.add_argument("--disable_train_randomization", action="store_true",
+                    help="Disable observation/dynamics/action-delay randomization during training for nominal precision fine-tuning")
 parser.add_argument("--action_bias", type=str, default=None,
                     help="Comma-separated 4 values added to the actor's final bias on a fresh model "
                          "(warm-start near a known-good constant action, e.g. \"-0.5,0,0.5,0\").  "
@@ -65,6 +73,18 @@ parser.add_argument("--precision_sigma", type=float, default=0.10,
                     help="Std-dev of the touchdown precision reward in meters")
 parser.add_argument("--landing_error_penalty", type=float, default=0.0,
                     help="Linear touchdown penalty weight in reward per meter of landing error")
+parser.add_argument("--short_precision_reward_scale", type=float, default=None,
+                    help="Override --precision_reward_scale on short hops")
+parser.add_argument("--long_precision_reward_scale", type=float, default=None,
+                    help="Override --precision_reward_scale on long hops")
+parser.add_argument("--short_precision_sigma", type=float, default=None,
+                    help="Override --precision_sigma on short hops")
+parser.add_argument("--long_precision_sigma", type=float, default=None,
+                    help="Override --precision_sigma on long hops")
+parser.add_argument("--short_landing_error_penalty", type=float, default=None,
+                    help="Override --landing_error_penalty on short hops")
+parser.add_argument("--long_landing_error_penalty", type=float, default=None,
+                    help="Override --landing_error_penalty on long hops")
 parser.add_argument("--pair_success_reward", type=float, default=12.0,
                     help="Delayed reward assigned to both eligible actions when the pair succeeds")
 parser.add_argument("--prepared_reward", type=float, default=0.0,
@@ -87,6 +107,10 @@ parser.add_argument("--first_action_scorer", default=None,
                     help="Optional first-hop state-action scorer trained on final pair success")
 parser.add_argument("--scorer_quality_weight", type=float, default=0.0,
                     help="Weight of dense quality prediction in candidate ranking; zero uses hit probability only")
+parser.add_argument("--scorer_threshold_override", type=float, default=None,
+                    help="Override the second-hop scorer's saved selection threshold")
+parser.add_argument("--first_scorer_threshold_override", type=float, default=None,
+                    help="Override the first-hop scorer's saved selection threshold")
 parser.add_argument("--passive_airborne", action="store_true",
                     help="Disable high-level descent motor correction; the hop must be prepared through the latched touchdown-state plan.")
 parser.add_argument("--correction_mode", choices=("none", "descent", "landing"), default="descent",
@@ -122,11 +146,28 @@ if args.target_tolerance <= 0.0:
     parser.error("--target_tolerance must be positive")
 if args.precision_sigma <= 0.0:
     parser.error("--precision_sigma must be positive")
-action_offset_arg = None
-if args.action_offset is not None:
-    action_offset_arg = [float(x) for x in args.action_offset.split(",")]
-    if len(action_offset_arg) != 4:
-        parser.error("--action_offset expects 4 comma-separated values")
+for name in ("short_precision_sigma", "long_precision_sigma"):
+    value = getattr(args, name)
+    if value is not None and value <= 0.0:
+        parser.error(f"--{name} must be positive")
+def parse_action_offset(value: str | None, name: str) -> list[float] | None:
+    if value is None:
+        return None
+    parsed = [float(x) for x in value.split(",")]
+    if len(parsed) != 4:
+        parser.error(f"{name} expects 4 comma-separated values")
+    return parsed
+
+
+action_offset_arg = parse_action_offset(args.action_offset, "--action_offset")
+short_action_offset_arg = parse_action_offset(args.short_action_offset, "--short_action_offset")
+long_action_offset_arg = parse_action_offset(args.long_action_offset, "--long_action_offset")
+short_precision_reward_scale = args.precision_reward_scale if args.short_precision_reward_scale is None else args.short_precision_reward_scale
+long_precision_reward_scale = args.precision_reward_scale if args.long_precision_reward_scale is None else args.long_precision_reward_scale
+short_precision_sigma = args.precision_sigma if args.short_precision_sigma is None else args.short_precision_sigma
+long_precision_sigma = args.precision_sigma if args.long_precision_sigma is None else args.long_precision_sigma
+short_landing_error_penalty = args.landing_error_penalty if args.short_landing_error_penalty is None else args.short_landing_error_penalty
+long_landing_error_penalty = args.landing_error_penalty if args.long_landing_error_penalty is None else args.long_landing_error_penalty
 args.continuous_queue = not args.pair_restart_queue
 args.headless = True
 args.rendering_mode = "performance"
@@ -234,9 +275,10 @@ def env_cfg(evaluation: bool) -> PlannerRandomTwoHopEnvCfg:
     cfg.seed = args.seed
     cfg.debug_vis = False
     cfg.force_full_planner = True
-    cfg.observation_noise_std = 0.0 if evaluation else 0.002
-    cfg.randomize_dynamics = not evaluation
-    cfg.randomize_action_delay = not evaluation
+    randomize_training = (not evaluation) and (not args.disable_train_randomization)
+    cfg.observation_noise_std = 0.0 if not randomize_training else 0.002
+    cfg.randomize_dynamics = randomize_training
+    cfg.randomize_action_delay = randomize_training
     cfg.target_height = 1.0
     cfg.alternate_target_heights = False
     cfg.fixed_height_curriculum = False
@@ -334,12 +376,19 @@ def save(path, model, optimizer, update):
                           "precision_reward_scale": args.precision_reward_scale,
                           "precision_sigma": args.precision_sigma,
                           "landing_error_penalty": args.landing_error_penalty,
+                          "short_precision_reward_scale": short_precision_reward_scale,
+                          "long_precision_reward_scale": long_precision_reward_scale,
+                          "short_precision_sigma": short_precision_sigma,
+                          "long_precision_sigma": long_precision_sigma,
+                          "short_landing_error_penalty": short_landing_error_penalty,
+                          "long_landing_error_penalty": long_landing_error_penalty,
                           "prepared_reward": args.prepared_reward,
                           "touchdown_attitude_penalty": args.touchdown_attitude_penalty,
                           "touchdown_next_velocity_penalty": args.touchdown_next_velocity_penalty,
                           "curriculum_by_hops": True,
                           "curriculum_iterations": args.curriculum_iterations,
                           "lr": args.lr, "std_start": args.std_start, "std_end": args.std_end,
+                          "disable_train_randomization": args.disable_train_randomization,
                           "gamma_frame": args.gamma_frame, "anchor_scale": args.anchor_scale}}, path)
 
 
@@ -402,6 +451,8 @@ def main():
         scorer.eval()
         candidate_offsets = scorer_data["candidate_offsets"].to(device)
         scorer_threshold = float(scorer_data.get("selection_threshold", 0.0))
+        if args.scorer_threshold_override is not None:
+            scorer_threshold = args.scorer_threshold_override
         print(f"[SELECTOR] loaded {len(candidate_offsets)} second-hop candidates", flush=True)
     first_scorer = None
     first_candidate_offsets = None
@@ -413,6 +464,8 @@ def main():
         first_scorer.eval()
         first_candidate_offsets = first_data["candidate_offsets"].to(device)
         first_scorer_threshold = float(first_data.get("selection_threshold", 0.0))
+        if args.first_scorer_threshold_override is not None:
+            first_scorer_threshold = args.first_scorer_threshold_override
         print(f"[SELECTOR] loaded {len(first_candidate_offsets)} first-hop pair candidates", flush=True)
 
     def apply_selector(observations, base_action, mask, selector, offsets, threshold):
@@ -448,6 +501,12 @@ def main():
         )
         if action_offset_tensor is not None:
             base_action = base_action + action_offset_tensor
+        short_hop = observations[:, -3:-2] > 0.5
+        long_hop = observations[:, -2:-1] > 0.5
+        if short_action_offset_tensor is not None:
+            base_action = torch.where(short_hop, base_action + short_action_offset_tensor, base_action)
+        if long_action_offset_tensor is not None:
+            base_action = torch.where(long_hop, base_action + long_action_offset_tensor, base_action)
         return base_action.clamp(-1.0, 1.0)
     bias_tensor = (
         torch.tensor([float(x) for x in args.action_bias.split(",")], device=device)
@@ -459,6 +518,25 @@ def main():
         if action_offset_arg is not None
         else None
     )
+    short_action_offset_tensor = (
+        torch.tensor(short_action_offset_arg, device=device)
+        if short_action_offset_arg is not None
+        else None
+    )
+    long_action_offset_tensor = (
+        torch.tensor(long_action_offset_arg, device=device)
+        if long_action_offset_arg is not None
+        else None
+    )
+
+    def apply_phase_grid_offset(observations: torch.Tensor, action: torch.Tensor, offset: torch.Tensor) -> torch.Tensor:
+        if args.offset_grid_phase == "all":
+            return (action + offset).clamp(-1.0, 1.0)
+        if args.offset_grid_phase == "short":
+            mask = observations[:, -3:-2] > 0.5
+        else:
+            mask = observations[:, -2:-1] > 0.5
+        return torch.where(mask, action + offset, action).clamp(-1.0, 1.0)
 
     obs, _ = env.reset()
     obs = obs["policy"]
@@ -469,6 +547,9 @@ def main():
         group = None
         grid_actions = None
         grid_offsets = None
+        split_count = torch.zeros(2, device=device)
+        split_hit = torch.zeros(2, device=device)
+        split_error = torch.zeros(2, device=device)
         if args.grid_search:
             values = torch.linspace(-0.5, 0.5, 5, device=device)
             forward, tilt = torch.meshgrid(values, values, indexing="ij")
@@ -484,27 +565,53 @@ def main():
             grid_offsets[:, 0] = forward.flatten()
             grid_offsets[:, 2] = tilt.flatten()
             group = torch.arange(args.num_envs, device=device) % 25
-            held = (selected_mean(obs) + grid_offsets[group]).clamp(-1.0, 1.0)
+            held = apply_phase_grid_offset(obs, selected_mean(obs), grid_offsets[group])
         elif constant_eval:
             held.zero_()
             held[:, 0] = args.constant_forward or 0.0
             held[:, 2] = args.constant_tilt or 0.0
         for _ in range(args.eval_steps):
+            core = base.unwrapped
+            target_before, _ = core.commands.lookahead()
+            target_before = target_before.clone()
+            phase_was_short = ((core.commands.route_index % 2) == 0).clone()
             obs_dict, _, dones, _ = env.step(held)
             dones = dones.reshape(-1) > 0  # bool mask, see rollout branch
             obs = obs_dict["policy"]
-            boundary = base.unwrapped._touchdown_event | dones
+            touchdown = core._touchdown_event
+            if torch.any(touchdown):
+                landing_error = torch.linalg.norm(
+                    core._robot.data.root_pos_w[:, :2] - target_before, dim=1
+                )
+                for split_id, mask in (
+                    (0, touchdown & phase_was_short),
+                    (1, touchdown & (~phase_was_short)),
+                ):
+                    if torch.any(mask):
+                        split_count[split_id] += mask.sum()
+                        split_hit[split_id] += core._target_hit_event[mask].float().sum()
+                        split_error[split_id] += landing_error[mask].sum()
+            boundary = touchdown | dones
             if torch.any(boundary):
                 with torch.no_grad():
                     if args.grid_search:
                         held[boundary] = grid_actions[group[boundary]]
                     elif args.offset_grid_search:
-                        held[boundary] = (
-                            selected_mean(obs[boundary]) + grid_offsets[group[boundary]]
-                        ).clamp(-1.0, 1.0)
+                        held[boundary] = apply_phase_grid_offset(
+                            obs[boundary], selected_mean(obs[boundary]), grid_offsets[group[boundary]]
+                        )
                     elif not constant_eval:
                         held[boundary] = selected_mean(obs[boundary])
         metrics(base.unwrapped)
+        split_names = ("short", "long")
+        for split_id, name in enumerate(split_names):
+            count = split_count[split_id].clamp_min(1.0)
+            print(
+                f"[EVAL-SPLIT] {name}_count={split_count[split_id].item():.0f} "
+                f"{name}_hit_rate={(split_hit[split_id] / count).item():.6f} "
+                f"{name}_touchdown_error_m={(split_error[split_id] / count).item():.6f}",
+                flush=True,
+            )
         if args.grid_search or args.offset_grid_search:
             core = base.unwrapped
             for grid_id in range(25):
@@ -547,6 +654,9 @@ def main():
         "weight": torch.ones_like(hop_return),
     }
     pending_valid = torch.zeros(args.num_envs, dtype=torch.bool, device=device)
+    train_split_count = torch.zeros(2, device=device)
+    train_split_hit = torch.zeros(2, device=device)
+    train_split_error = torch.zeros(2, device=device)
 
     wall_t0 = datetime.now()
     frame_count = 0
@@ -581,15 +691,38 @@ def main():
             landing_error = torch.linalg.norm(
                 core._robot.data.root_pos_w[:, :2] - target_before, dim=1
             )
+            for split_id, split_mask in (
+                (0, touchdown & phase_was_short),
+                (1, touchdown & (~phase_was_short)),
+            ):
+                if torch.any(split_mask):
+                    train_split_count[split_id] += split_mask.float().sum()
+                    train_split_hit[split_id] += hit[split_mask].float().sum()
+                    train_split_error[split_id] += landing_error[split_mask].sum()
             event_reward = torch.zeros(args.num_envs, device=device)
             event_reward[touchdown] += torch.where(
                 hit[touchdown], torch.full_like(landing_error[touchdown], args.hit_reward),
                 torch.full_like(landing_error[touchdown], args.miss_penalty),
             )
-            event_reward[touchdown] += args.precision_reward_scale * torch.exp(
-                -landing_error[touchdown].square() / (2.0 * args.precision_sigma**2)
+            precision_scale = torch.where(
+                phase_was_short,
+                torch.full_like(landing_error, short_precision_reward_scale),
+                torch.full_like(landing_error, long_precision_reward_scale),
             )
-            event_reward[touchdown] -= args.landing_error_penalty * landing_error[touchdown]
+            precision_sigma = torch.where(
+                phase_was_short,
+                torch.full_like(landing_error, short_precision_sigma),
+                torch.full_like(landing_error, long_precision_sigma),
+            )
+            error_penalty = torch.where(
+                phase_was_short,
+                torch.full_like(landing_error, short_landing_error_penalty),
+                torch.full_like(landing_error, long_landing_error_penalty),
+            )
+            event_reward[touchdown] += precision_scale[touchdown] * torch.exp(
+                -landing_error[touchdown].square() / (2.0 * precision_sigma[touchdown].square())
+            )
+            event_reward[touchdown] -= error_penalty[touchdown] * landing_error[touchdown]
             event_reward[touchdown] += (
                 args.prepared_reward
                 * core._prepared_landing_event[touchdown].float()
@@ -738,6 +871,12 @@ def main():
         prepared = core._prepared_landing_count.sum().float() / hits
         attitude_error = core._touchdown_attitude_error_sum.sum() / hits
         next_velocity_error = core._touchdown_next_velocity_error_sum.sum() / hits
+        short_count = train_split_count[0].clamp_min(1.0)
+        long_count = train_split_count[1].clamp_min(1.0)
+        short_hit = train_split_hit[0] / short_count
+        long_hit = train_split_hit[1] / long_count
+        short_error = train_split_error[0] / short_count
+        long_error = train_split_error[1] / long_count
         correction_mode = "none" if args.passive_airborne else args.correction_mode
         motor_correction = torch.as_tensor(
             0.0 if correction_mode == "none" else args.motor_correction_limit,
@@ -749,6 +888,8 @@ def main():
               f"conditional={(core._conditional_second_hits.sum()/cond).item():.4f} "
               f"hit={(core._target_hit_count.sum()/hits).item():.4f} "
               f"error={(core._touchdown_error_sum.sum()/hits).item():.4f} "
+              f"short_hit={short_hit.item():.4f} short_err={short_error.item():.4f} "
+              f"long_hit={long_hit.item():.4f} long_err={long_error.item():.4f} "
               f"prepared={prepared.item():.4f} "
               f"att_err={attitude_error.item():.4f} "
               f"next_v_err={next_velocity_error.item():.4f} "
