@@ -480,3 +480,105 @@ Conclusion: error-tail instrumentation is now in place. PPO tail penalties did
 not yet produce a better checkpoint; for visualization/deployment A/B, keep
 `model_466.pt` and use `--short_action_offset=0.24,0,-0.12,0` as the only
 currently verified tail-reducing tweak.
+
+## 2026-08-26 Standard RSL-RL Runner Control
+
+Added a standard RSL-RL PPO control experiment:
+
+```text
+experiments/random_two_hop/train_two_hop_rslrl.py
+```
+
+This keeps the same frozen 43-D teacher, 69-D state-planner observation,
+continuous P_t/P_(t+1) random route, short/long distances, landing-only
+correction, and tail metrics, but uses stock `OnPolicyRunner.learn()` instead
+of the custom Semi-MDP PPO loop. The robot physics and teacher remain
+unchanged.
+
+The wrapper now logs tail metrics for standard RSL-RL training:
+
+```text
+Metrics/short_tail10_rate
+Metrics/short_tail15_rate
+Metrics/long_tail10_rate
+Metrics/long_tail15_rate
+```
+
+Pilot command:
+
+```bash
+/home/terry/Documents/isaacsim/isaac-sim-standalone-5.1.0-linux-x86_64/python.sh \
+  experiments/random_two_hop/train_two_hop_rslrl.py \
+  --teacher_checkpoint saved_checkpoints/professor_approved_v36_teacher/model_90.pt \
+  --iterations 30 \
+  --num_envs 256 \
+  --num_steps_per_env 128 \
+  --save_interval 10 \
+  --target_tolerance 0.10 \
+  --short_radius_min 0.2 \
+  --short_radius_max 0.5 \
+  --long_radius_min 0.5 \
+  --long_radius_max 0.8 \
+  --curriculum_iterations 0 \
+  --correction_mode landing \
+  --motor_correction_limit 0.014 \
+  --velocity_feedback_gain 0.020 \
+  --attitude_feedback_gain 0.100 \
+  --landing_correction_height 0.20 \
+  --disable_train_randomization \
+  --tail_error_threshold 0.10 \
+  --short_tail_error_penalty 2.0 \
+  --long_tail_error_penalty 1.0 \
+  --init_noise_std 0.02 \
+  --lr 1e-5 \
+  --entropy_coef 0.0
+```
+
+Pilot log:
+
+```text
+logs/rsl_rl/quadhopper_planner_random_two_hop_v58_rslrl_state_planner_continuous_queue_ppo/2026-08-26_12-48-14
+```
+
+The standard runner restores the full RSL-RL iteration printout. Training
+metrics briefly looked strong early, but direct eval did not beat the current
+Semi-MDP checkpoint.
+
+Direct eval, 500 envs, 3000 steps:
+
+```text
+RSL-RL model_0.pt:
+  target_hit_rate                 0.680577
+  touchdown_error_m               0.084732
+  pair                            0.470833
+  short_tail10_rate               0.369057
+  short_tail15_rate               0.121388
+
+RSL-RL model_10.pt:
+  target_hit_rate                 0.671877
+  touchdown_error_m               0.084915
+  pair                            0.460154
+  short_tail10_rate               0.375267
+  short_tail15_rate               0.124733
+
+RSL-RL model_20.pt:
+  target_hit_rate                 0.673768
+  touchdown_error_m               0.084957
+  pair                            0.461917
+  short_tail10_rate               0.374656
+  short_tail15_rate               0.121527
+
+RSL-RL model_29.pt:
+  target_hit_rate                 0.671955
+  touchdown_error_m               0.084906
+  pair                            0.455371
+  short_tail10_rate               0.376489
+  short_tail15_rate               0.119084
+```
+
+Conclusion: the standard runner is useful as a logging/stability control, but
+this first state-planner pilot did not outperform `model_466.pt`. The likely
+issue is not the runner itself; it is that step-level state-planner reward still
+does not give a clean enough touchdown/pair credit signal. Keep the RSL-RL
+script for further controlled experiments, but do not use these pilot
+checkpoints for deployment.

@@ -43,6 +43,9 @@ class TeacherTwoHopStatePlannerVecEnv(VecEnv):
         state_reward_scale: float = 80.0,
         expert_anchor_scale: float = 20.0,
         stance_plan_rate: float = 0.10,
+        tail_error_threshold: float = 0.10,
+        short_tail_error_penalty: float = 0.0,
+        long_tail_error_penalty: float = 0.0,
     ):
         self.base_env = base_env
         self.teacher_model = teacher_model
@@ -63,6 +66,9 @@ class TeacherTwoHopStatePlannerVecEnv(VecEnv):
         self.state_reward_scale = float(state_reward_scale)
         self.expert_anchor_scale = float(expert_anchor_scale)
         self.stance_plan_rate = float(stance_plan_rate)
+        self.tail_error_threshold = float(tail_error_threshold)
+        self.short_tail_error_penalty = float(short_tail_error_penalty)
+        self.long_tail_error_penalty = float(long_tail_error_penalty)
 
         self.num_envs = base_env.num_envs
         self.num_actions = 4
@@ -78,6 +84,11 @@ class TeacherTwoHopStatePlannerVecEnv(VecEnv):
             self.num_envs, dtype=torch.bool, device=self.device
         )
         self._previous_active = self.base_env.unwrapped._cycle_active.clone()
+        self._split_count = torch.zeros(2, device=self.device)
+        self._split_hit = torch.zeros(2, device=self.device)
+        self._split_error = torch.zeros(2, device=self.device)
+        self._split_tail10 = torch.zeros(2, device=self.device)
+        self._split_tail15 = torch.zeros(2, device=self.device)
         self._obs = self._planner_observations()
 
     @property
@@ -206,6 +217,11 @@ class TeacherTwoHopStatePlannerVecEnv(VecEnv):
         self._latched_command.zero_()
         self._needs_new_plan.fill_(True)
         self._previous_active = self.base_env.unwrapped._cycle_active.clone()
+        self._split_count.zero_()
+        self._split_hit.zero_()
+        self._split_error.zero_()
+        self._split_tail10.zero_()
+        self._split_tail15.zero_()
         self._obs = self._planner_observations()
         return self._obs_dict(), extras
 
@@ -216,6 +232,9 @@ class TeacherTwoHopStatePlannerVecEnv(VecEnv):
 
     def step(self, planner_actions):
         core = self.base_env.unwrapped
+        target_before, _ = core.commands.lookahead()
+        target_before = target_before.clone()
+        phase_was_short = ((core.commands.route_index % 2) == 0).clone()
         # Causally refine one plan throughout stance, then freeze it in flight.
         # Every PPO action used for learning therefore affects the executed
         # command; this removes the ignored-action credit mismatch in v41.
@@ -240,6 +259,27 @@ class TeacherTwoHopStatePlannerVecEnv(VecEnv):
 
         touchdown = core._touchdown_event
         if torch.any(touchdown):
+            landing_error = torch.linalg.norm(
+                core._robot.data.root_pos_w[:, :2] - target_before, dim=1
+            )
+            for split_id, split_mask in (
+                (0, touchdown & phase_was_short),
+                (1, touchdown & (~phase_was_short)),
+            ):
+                if torch.any(split_mask):
+                    self._split_count[split_id] += split_mask.float().sum()
+                    self._split_hit[split_id] += core._target_hit_event[split_mask].float().sum()
+                    self._split_error[split_id] += landing_error[split_mask].sum()
+                    self._split_tail10[split_id] += (landing_error[split_mask] > 0.10).float().sum()
+                    self._split_tail15[split_id] += (landing_error[split_mask] > 0.15).float().sum()
+            tail_penalty = torch.where(
+                phase_was_short,
+                torch.full_like(landing_error, self.short_tail_error_penalty),
+                torch.full_like(landing_error, self.long_tail_error_penalty),
+            )
+            reward = reward - touchdown.float() * tail_penalty * (
+                landing_error - self.tail_error_threshold
+            ).clamp_min(0.0)
             _, _, vxy_b, _, axis_b, _ = self._guidance()
             next_b = next_b_before
             # This target is independent of the policy command.  The old loss
@@ -261,9 +301,19 @@ class TeacherTwoHopStatePlannerVecEnv(VecEnv):
         self._obs = self._planner_observations()
         attempts = core._conditional_second_attempts.sum().float()
         pair_attempts = core._pair_attempts.sum().float()
+        short_count = self._split_count[0].clamp_min(1.0)
+        long_count = self._split_count[1].clamp_min(1.0)
         log = extras.setdefault("log", {})
         log["Metrics/conditional_second_hit_rate"] = core._conditional_second_hits.sum().float() / attempts.clamp_min(1.0)
         log["Metrics/two_hop_pair_success_rate"] = core._pair_hits.sum().float() / pair_attempts.clamp_min(1.0)
+        log["Metrics/short_hit_rate"] = self._split_hit[0] / short_count
+        log["Metrics/short_touchdown_error_m"] = self._split_error[0] / short_count
+        log["Metrics/short_tail10_rate"] = self._split_tail10[0] / short_count
+        log["Metrics/short_tail15_rate"] = self._split_tail15[0] / short_count
+        log["Metrics/long_hit_rate"] = self._split_hit[1] / long_count
+        log["Metrics/long_touchdown_error_m"] = self._split_error[1] / long_count
+        log["Metrics/long_tail10_rate"] = self._split_tail10[1] / long_count
+        log["Metrics/long_tail15_rate"] = self._split_tail15[1] / long_count
         log["Metrics/state_planner_motor_correction"] = correction.abs().mean()
         log["Metrics/state_planner_motor_clip_fraction"] = (
             torch.zeros((), device=self.device)
