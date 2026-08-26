@@ -582,3 +582,65 @@ issue is not the runner itself; it is that step-level state-planner reward still
 does not give a clean enough touchdown/pair credit signal. Keep the RSL-RL
 script for further controlled experiments, but do not use these pilot
 checkpoints for deployment.
+
+## 2026-08-26 Offline Tail-Selector Experiment
+
+Goal: test whether the large visible landing-error tail can be reduced by an
+offline state-action selector/refiner without retraining the main planner.
+
+Tools added:
+
+```text
+experiments/random_two_hop/analyze_tail_candidates.py
+experiments/random_two_hop/train_second_hop_scorer.py --label_key not_tail10|not_tail15 --use_dataset_candidate_offsets
+```
+
+Oracle analysis on the existing v57 short/long candidate datasets shows that
+there is real recoverable tail error, especially on the second hop:
+
+```text
+first-hop candidates:
+  base_error                  0.066251
+  oracle_min_error            0.053845
+  base_tail10                 0.167969
+  oracle_tail10               0.105469
+  tail_rescued_to_10          0.372093
+
+second-hop candidates:
+  base_error                  0.075524
+  oracle_min_error            0.032137
+  base_tail10                 0.238281
+  oracle_tail10               0.011719
+  tail_rescued_to_10          0.950820
+```
+
+Two online direct-eval checks were run with a learned second-hop `not_tail10`
+scorer:
+
+```text
+random deployment offsets, threshold override 0.0:
+  target_hit_rate             0.672663
+  touchdown_error_m           0.085241
+  pair                        0.465456
+
+dataset candidate offsets, learned threshold 0.100:
+  target_hit_rate             0.680362
+  touchdown_error_m           0.084359
+  pair                        0.473992
+  short_tail10_rate           0.366371
+  long_tail10_rate            0.268698
+
+dataset candidate offsets + short_action_offset=0.24,0,-0.12,0:
+  target_hit_rate             0.678232
+  touchdown_error_m           0.084456
+  pair                        0.470688
+  short_tail10_rate           0.368309
+  long_tail10_rate            0.270195
+```
+
+Conclusion: the offline oracle proves that the tail is fixable, but the current
+learned selector should not be enabled for deployment. It moves actions often
+enough to lose pair success, even when using the same eight candidate offsets as
+the search data. The better next route is to recycle the saved candidate search
+failures into PPO fine-tuning or train a stricter failure gate that intervenes
+only when the original action is predicted to be in the tail.

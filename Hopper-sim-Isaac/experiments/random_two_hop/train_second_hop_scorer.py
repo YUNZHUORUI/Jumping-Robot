@@ -22,7 +22,11 @@ parser.add_argument("--epochs", type=int, default=200)
 parser.add_argument("--batch_size", type=int, default=512)
 parser.add_argument("--lr", type=float, default=3e-4)
 parser.add_argument("--seed", type=int, default=11)
-parser.add_argument("--label_key", choices=("hit", "second_hit", "pair_hit"), default="hit")
+parser.add_argument(
+    "--label_key",
+    choices=("hit", "second_hit", "pair_hit", "not_tail10", "not_tail15"),
+    default="hit",
+)
 parser.add_argument("--selection_quality_weight", type=float, default=0.10,
                     help="Weight on predicted touchdown quality when selecting within a context")
 parser.add_argument("--classification_weight", type=float, default=1.0)
@@ -41,6 +45,11 @@ parser.add_argument(
 )
 parser.add_argument("--deployment_candidates", type=int, default=32)
 parser.add_argument("--deployment_candidate_scale", type=float, default=0.20)
+parser.add_argument(
+    "--use_dataset_candidate_offsets",
+    action="store_true",
+    help="Deploy with the candidate offsets saved in the search dataset.",
+)
 args = parser.parse_args()
 
 
@@ -56,13 +65,18 @@ def main():
     val_mask = torch.isin(data["context_id"], val_contexts)
     train_ids = torch.where(train_mask)[0]
     val_ids = torch.where(val_mask)[0]
-    obs, action, hit = data["observation"], data["action"], data[args.label_key]
     score = data["score"]
+    landing_error = data["position"].clamp_min(0.0).sqrt() * 0.10
+    if args.label_key == "not_tail10":
+        hit = (landing_error <= 0.10).float()
+    elif args.label_key == "not_tail15":
+        hit = (landing_error <= 0.15).float()
+    else:
+        hit = data[args.label_key]
+    obs, action = data["observation"], data["action"]
     score_mean, score_std = score[train_ids].mean(), score[train_ids].std().clamp_min(1.0)
     quality = ((score - score_mean) / score_std).clamp(-5.0, 5.0)
     positive_weight = (1.0 - hit[train_ids].mean()) / hit[train_ids].mean().clamp_min(1e-4)
-    landing_error = data["position"].clamp_min(0.0).sqrt() * 0.10
-
     model = SecondHopScorer().to(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-4)
     bce = nn.BCEWithLogitsLoss(pos_weight=positive_weight)
@@ -153,14 +167,18 @@ def main():
     threshold_index = threshold_metrics.argmax()
     selection_threshold = threshold_grid[threshold_index].item()
     gated_metric = threshold_metrics[threshold_index].item()
-    # Deployment candidates are independent of any one collection batch.
-    # Candidate zero always preserves the original planner action.
-    generator = torch.Generator(device="cpu").manual_seed(args.seed + 99173)
-    candidate_offsets = torch.zeros(args.deployment_candidates, 4)
-    if args.deployment_candidates > 1:
-        candidate_offsets[1:] = args.deployment_candidate_scale * (
-            2.0 * torch.rand(args.deployment_candidates - 1, 4, generator=generator) - 1.0
-        )
+    if args.use_dataset_candidate_offsets:
+        if "candidate_offsets" not in data:
+            raise KeyError("--use_dataset_candidate_offsets requires candidate_offsets in the dataset")
+        candidate_offsets = data["candidate_offsets"].detach().cpu()
+    else:
+        # Candidate zero always preserves the original planner action.
+        generator = torch.Generator(device="cpu").manual_seed(args.seed + 99173)
+        candidate_offsets = torch.zeros(args.deployment_candidates, 4)
+        if args.deployment_candidates > 1:
+            candidate_offsets[1:] = args.deployment_candidate_scale * (
+                2.0 * torch.rand(args.deployment_candidates - 1, 4, generator=generator) - 1.0
+            )
     torch.save({"model_state_dict": best_state, "score_mean": score_mean.cpu(),
                 "score_std": score_std.cpu(), "infos": {"heldout_contexts": len(val_contexts),
                 "best_metric": best_metric, "label_key": args.label_key,
@@ -169,6 +187,7 @@ def main():
                 "quality_loss_weight": args.quality_loss_weight,
                 "model_selection_metric": args.model_selection_metric,
                 "threshold_metric": args.threshold_metric,
+                "use_dataset_candidate_offsets": args.use_dataset_candidate_offsets,
                 "gated_metric": gated_metric},
                 "candidate_offsets": candidate_offsets,
                 "selection_threshold": selection_threshold}, output)
