@@ -381,3 +381,102 @@ logs/rsl_rl/quadhopper_planner_random_two_hop_v57_landing_prep_continuous_queue_
 Conclusion: do not keep training PPO blindly from `model_466.pt` with the
 current reward variants. For now the safest model remains `model_466.pt`; the
 smallest deployable precision tweak is the short-hop runtime offset above.
+
+## 2026-08-26 Error Tail Optimization
+
+Added tail metrics and a hinge tail penalty to
+`experiments/random_two_hop/train_two_hop_semimdp.py`.
+
+New metrics printed in eval/training:
+
+```text
+short_tail10_rate / long_tail10_rate: fraction of touchdowns with error > 0.10 m
+short_tail15_rate / long_tail15_rate: fraction of touchdowns with error > 0.15 m
+```
+
+New training args:
+
+```text
+--tail_error_threshold
+--tail_error_penalty
+--short_tail_error_penalty
+--long_tail_error_penalty
+```
+
+Baseline tail eval for `model_466.pt`, 500 envs, 3000 steps:
+
+```text
+target_hit_rate                   0.681428
+touchdown_error_m                 0.084122
+two_hop_pair_success_rate         0.477378
+short_hit_rate                    0.628929
+short_touchdown_error_m           0.090069
+short_tail10_rate                 0.366951
+short_tail15_rate                 0.115807
+long_hit_rate                     0.734380
+long_touchdown_error_m            0.078123
+long_tail10_rate                  0.264697
+long_tail15_rate                  0.078947
+```
+
+Conservative PPO tail fine-tune was attempted from `model_466.pt`:
+
+```text
+logs/rsl_rl/quadhopper_planner_random_two_hop_v57_landing_prep_continuous_queue_semimdp_ppo/2026-08-26_10-06-43
+```
+
+It did not improve direct eval. Rejected candidates:
+
+```text
+model_475.pt:
+  target_hit_rate                 0.677392
+  touchdown_error_m               0.084972
+  pair                            0.468452
+  short_tail10_rate               0.367755
+  short_tail15_rate               0.121263
+
+model_477.pt:
+  target_hit_rate                 0.676960
+  touchdown_error_m               0.084687
+  pair                            0.464758
+  short_tail10_rate               0.371529
+  short_tail15_rate               0.125877
+```
+
+A short-hop offset tail grid with `--offset_grid_phase short
+--offset_grid_span 0.36` found promising per-grid candidates, but the best
+tail candidate `--short_action_offset=-0.18,0,-0.18,0` did not reproduce in
+direct eval and should not be used:
+
+```text
+target_hit_rate                   0.665243
+touchdown_error_m                 0.085748
+pair                              0.455288
+short_tail10_rate                 0.387265
+short_tail15_rate                 0.124903
+```
+
+The only tail/precision tweak that still reproduces is the previous small
+short-hop offset:
+
+```text
+--short_action_offset=0.24,0,-0.12,0
+
+target_hit_rate                   0.680934
+touchdown_error_m                 0.083896
+two_hop_pair_success_rate         0.480462
+prepared_landing_rate             0.459571
+short_hit_rate                    0.632012
+short_touchdown_error_m           0.089912
+short_tail10_rate                 0.364787
+short_tail15_rate                 0.112957
+long_hit_rate                     0.730308
+long_touchdown_error_m            0.077824
+long_tail10_rate                  0.268769
+long_tail15_rate                  0.073077
+```
+
+Conclusion: error-tail instrumentation is now in place. PPO tail penalties did
+not yet produce a better checkpoint; for visualization/deployment A/B, keep
+`model_466.pt` and use `--short_action_offset=0.24,0,-0.12,0` as the only
+currently verified tail-reducing tweak.

@@ -85,6 +85,14 @@ parser.add_argument("--short_landing_error_penalty", type=float, default=None,
                     help="Override --landing_error_penalty on short hops")
 parser.add_argument("--long_landing_error_penalty", type=float, default=None,
                     help="Override --landing_error_penalty on long hops")
+parser.add_argument("--tail_error_threshold", type=float, default=0.10,
+                    help="Touchdown error threshold in meters before tail penalty starts")
+parser.add_argument("--tail_error_penalty", type=float, default=0.0,
+                    help="Linear penalty per meter of touchdown error above --tail_error_threshold")
+parser.add_argument("--short_tail_error_penalty", type=float, default=None,
+                    help="Override --tail_error_penalty on short hops")
+parser.add_argument("--long_tail_error_penalty", type=float, default=None,
+                    help="Override --tail_error_penalty on long hops")
 parser.add_argument("--pair_success_reward", type=float, default=12.0,
                     help="Delayed reward assigned to both eligible actions when the pair succeeds")
 parser.add_argument("--prepared_reward", type=float, default=0.0,
@@ -146,6 +154,8 @@ if args.target_tolerance <= 0.0:
     parser.error("--target_tolerance must be positive")
 if args.precision_sigma <= 0.0:
     parser.error("--precision_sigma must be positive")
+if args.tail_error_threshold <= 0.0:
+    parser.error("--tail_error_threshold must be positive")
 for name in ("short_precision_sigma", "long_precision_sigma"):
     value = getattr(args, name)
     if value is not None and value <= 0.0:
@@ -168,6 +178,8 @@ short_precision_sigma = args.precision_sigma if args.short_precision_sigma is No
 long_precision_sigma = args.precision_sigma if args.long_precision_sigma is None else args.long_precision_sigma
 short_landing_error_penalty = args.landing_error_penalty if args.short_landing_error_penalty is None else args.short_landing_error_penalty
 long_landing_error_penalty = args.landing_error_penalty if args.long_landing_error_penalty is None else args.long_landing_error_penalty
+short_tail_error_penalty = args.tail_error_penalty if args.short_tail_error_penalty is None else args.short_tail_error_penalty
+long_tail_error_penalty = args.tail_error_penalty if args.long_tail_error_penalty is None else args.long_tail_error_penalty
 args.continuous_queue = not args.pair_restart_queue
 args.headless = True
 args.rendering_mode = "performance"
@@ -382,6 +394,10 @@ def save(path, model, optimizer, update):
                           "long_precision_sigma": long_precision_sigma,
                           "short_landing_error_penalty": short_landing_error_penalty,
                           "long_landing_error_penalty": long_landing_error_penalty,
+                          "tail_error_threshold": args.tail_error_threshold,
+                          "tail_error_penalty": args.tail_error_penalty,
+                          "short_tail_error_penalty": short_tail_error_penalty,
+                          "long_tail_error_penalty": long_tail_error_penalty,
                           "prepared_reward": args.prepared_reward,
                           "touchdown_attitude_penalty": args.touchdown_attitude_penalty,
                           "touchdown_next_velocity_penalty": args.touchdown_next_velocity_penalty,
@@ -550,6 +566,11 @@ def main():
         split_count = torch.zeros(2, device=device)
         split_hit = torch.zeros(2, device=device)
         split_error = torch.zeros(2, device=device)
+        split_tail10 = torch.zeros(2, device=device)
+        split_tail15 = torch.zeros(2, device=device)
+        grid_touchdown = torch.zeros(25, device=device) if (args.grid_search or args.offset_grid_search) else None
+        grid_tail10 = torch.zeros(25, device=device) if (args.grid_search or args.offset_grid_search) else None
+        grid_tail15 = torch.zeros(25, device=device) if (args.grid_search or args.offset_grid_search) else None
         if args.grid_search:
             values = torch.linspace(-0.5, 0.5, 5, device=device)
             forward, tilt = torch.meshgrid(values, values, indexing="ij")
@@ -583,6 +604,19 @@ def main():
                 landing_error = torch.linalg.norm(
                     core._robot.data.root_pos_w[:, :2] - target_before, dim=1
                 )
+                if group is not None:
+                    touchdown_ids = torch.where(touchdown)[0]
+                    touchdown_group = group[touchdown_ids]
+                    touchdown_error = landing_error[touchdown_ids]
+                    grid_touchdown.scatter_add_(
+                        0, touchdown_group, torch.ones_like(touchdown_error)
+                    )
+                    grid_tail10.scatter_add_(
+                        0, touchdown_group, (touchdown_error > 0.10).float()
+                    )
+                    grid_tail15.scatter_add_(
+                        0, touchdown_group, (touchdown_error > 0.15).float()
+                    )
                 for split_id, mask in (
                     (0, touchdown & phase_was_short),
                     (1, touchdown & (~phase_was_short)),
@@ -591,6 +625,8 @@ def main():
                         split_count[split_id] += mask.sum()
                         split_hit[split_id] += core._target_hit_event[mask].float().sum()
                         split_error[split_id] += landing_error[mask].sum()
+                        split_tail10[split_id] += (landing_error[mask] > 0.10).float().sum()
+                        split_tail15[split_id] += (landing_error[mask] > 0.15).float().sum()
             boundary = touchdown | dones
             if torch.any(boundary):
                 with torch.no_grad():
@@ -609,7 +645,9 @@ def main():
             print(
                 f"[EVAL-SPLIT] {name}_count={split_count[split_id].item():.0f} "
                 f"{name}_hit_rate={(split_hit[split_id] / count).item():.6f} "
-                f"{name}_touchdown_error_m={(split_error[split_id] / count).item():.6f}",
+                f"{name}_touchdown_error_m={(split_error[split_id] / count).item():.6f} "
+                f"{name}_tail10_rate={(split_tail10[split_id] / count).item():.6f} "
+                f"{name}_tail15_rate={(split_tail15[split_id] / count).item():.6f}",
                 flush=True,
             )
         if args.grid_search or args.offset_grid_search:
@@ -625,7 +663,9 @@ def main():
                     f"tilt={values_to_print[grid_id,2].item():+.3f} "
                     f"pair={(core._pair_hits[mask].sum()/pair_attempts).item():.4f} "
                     f"hit={(core._target_hit_count[mask].sum()/touchdowns).item():.4f} "
-                    f"error={(core._touchdown_error_sum[mask].sum()/touchdowns).item():.4f}",
+                    f"error={(core._touchdown_error_sum[mask].sum()/touchdowns).item():.4f} "
+                    f"tail10={(grid_tail10[grid_id]/grid_touchdown[grid_id].clamp_min(1.0)).item():.4f} "
+                    f"tail15={(grid_tail15[grid_id]/grid_touchdown[grid_id].clamp_min(1.0)).item():.4f}",
                     flush=True,
                 )
         env.close()
@@ -657,6 +697,8 @@ def main():
     train_split_count = torch.zeros(2, device=device)
     train_split_hit = torch.zeros(2, device=device)
     train_split_error = torch.zeros(2, device=device)
+    train_split_tail10 = torch.zeros(2, device=device)
+    train_split_tail15 = torch.zeros(2, device=device)
 
     wall_t0 = datetime.now()
     frame_count = 0
@@ -699,6 +741,8 @@ def main():
                     train_split_count[split_id] += split_mask.float().sum()
                     train_split_hit[split_id] += hit[split_mask].float().sum()
                     train_split_error[split_id] += landing_error[split_mask].sum()
+                    train_split_tail10[split_id] += (landing_error[split_mask] > 0.10).float().sum()
+                    train_split_tail15[split_id] += (landing_error[split_mask] > 0.15).float().sum()
             event_reward = torch.zeros(args.num_envs, device=device)
             event_reward[touchdown] += torch.where(
                 hit[touchdown], torch.full_like(landing_error[touchdown], args.hit_reward),
@@ -719,10 +763,18 @@ def main():
                 torch.full_like(landing_error, short_landing_error_penalty),
                 torch.full_like(landing_error, long_landing_error_penalty),
             )
+            tail_penalty = torch.where(
+                phase_was_short,
+                torch.full_like(landing_error, short_tail_error_penalty),
+                torch.full_like(landing_error, long_tail_error_penalty),
+            )
             event_reward[touchdown] += precision_scale[touchdown] * torch.exp(
                 -landing_error[touchdown].square() / (2.0 * precision_sigma[touchdown].square())
             )
             event_reward[touchdown] -= error_penalty[touchdown] * landing_error[touchdown]
+            event_reward[touchdown] -= tail_penalty[touchdown] * (
+                landing_error[touchdown] - args.tail_error_threshold
+            ).clamp_min(0.0)
             event_reward[touchdown] += (
                 args.prepared_reward
                 * core._prepared_landing_event[touchdown].float()
@@ -877,6 +929,10 @@ def main():
         long_hit = train_split_hit[1] / long_count
         short_error = train_split_error[0] / short_count
         long_error = train_split_error[1] / long_count
+        short_tail10 = train_split_tail10[0] / short_count
+        long_tail10 = train_split_tail10[1] / long_count
+        short_tail15 = train_split_tail15[0] / short_count
+        long_tail15 = train_split_tail15[1] / long_count
         correction_mode = "none" if args.passive_airborne else args.correction_mode
         motor_correction = torch.as_tensor(
             0.0 if correction_mode == "none" else args.motor_correction_limit,
@@ -889,7 +945,9 @@ def main():
               f"hit={(core._target_hit_count.sum()/hits).item():.4f} "
               f"error={(core._touchdown_error_sum.sum()/hits).item():.4f} "
               f"short_hit={short_hit.item():.4f} short_err={short_error.item():.4f} "
+              f"short_t10={short_tail10.item():.4f} short_t15={short_tail15.item():.4f} "
               f"long_hit={long_hit.item():.4f} long_err={long_error.item():.4f} "
+              f"long_t10={long_tail10.item():.4f} long_t15={long_tail15.item():.4f} "
               f"prepared={prepared.item():.4f} "
               f"att_err={attitude_error.item():.4f} "
               f"next_v_err={next_velocity_error.item():.4f} "
